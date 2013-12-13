@@ -147,6 +147,8 @@ static int	errordata_stack_depth = -1; /* index of topmost active frame */
 
 static int	recursion_depth = 0;	/* to detect actual recursion */
 
+static bool localize_message = true;
+
 /* buffers for formatted timestamps that might be used by both
  * log_line_prefix and csv logs.
  */
@@ -197,6 +199,18 @@ in_error_recursion_trouble(void)
 	return (recursion_depth > 2);
 }
 
+void
+enable_message_localization(void)
+{
+	localize_message = true;
+}
+
+void
+disable_message_localization(void)
+{
+	localize_message = false;
+}
+
 /*
  * One of those fallback steps is to stop trying to localize the error
  * message, since there's a significant probability that that's exactly
@@ -206,7 +220,7 @@ static inline const char *
 err_gettext(const char *str)
 {
 #ifdef ENABLE_NLS
-	if (in_error_recursion_trouble())
+	if (!localize_message || in_error_recursion_trouble())
 		return str;
 	else
 		return gettext(str);
@@ -704,7 +718,7 @@ errcode_for_socket_access(void)
 		char		   *fmtbuf; \
 		StringInfoData	buf; \
 		/* Internationalize the error format string */ \
-		if (translateit && !in_error_recursion_trouble()) \
+		if (translateit && localize_message && !in_error_recursion_trouble()) \
 			fmt = dgettext((domain), fmt);				  \
 		/* Expand %m in format string */ \
 		fmtbuf = expand_fmt_string(fmt, edata); \
@@ -745,7 +759,7 @@ errcode_for_socket_access(void)
 		char		   *fmtbuf; \
 		StringInfoData	buf; \
 		/* Internationalize the error format string */ \
-		if (!in_error_recursion_trouble()) \
+		if (localize_message && !in_error_recursion_trouble()) \
 			fmt = dngettext((domain), fmt_singular, fmt_plural, n); \
 		else \
 			fmt = (n == 1 ? fmt_singular : fmt_plural); \

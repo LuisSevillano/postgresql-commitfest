@@ -3970,6 +3970,11 @@ BackendInitialize(Port *port)
 	enable_timeout_after(STARTUP_PACKET_TIMEOUT, AuthenticationTimeout * 1000);
 
 	/*
+	 * Output messages in English because client encoding is not known yet.
+	 */
+	disable_message_localization();
+
+	/*
 	 * Receive the startup packet (which might turn out to be a cancel request
 	 * packet).
 	 */

@@ -736,6 +736,9 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		/* initialize client encoding */
 		InitializeClientEncoding();
 
+		/* now that client encoding is known, localize later messages */
+		enable_message_localization();
+
 		/* report this backend in the PgBackendStatus array */
 		pgstat_bestart();
 
@@ -912,6 +915,9 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 
 	/* initialize client encoding */
 	InitializeClientEncoding();
+
+	/* now that client encoding is known, localize later messages */
+	enable_message_localization();
 
 	/* report this backend in the PgBackendStatus array */
 	if (!bootstrap)
