@@ -538,13 +538,13 @@ ECPGconnect(int lineno, int c, const char *name, const char *user, const char *p
 		conn_values[i] = realname;
 		i++;
 	}
-	if (host)
+	if (host && strlen(host) > 0)
 	{
 		conn_keywords[i] = "host";
 		conn_values[i] = host;
 		i++;
 	}
-	if (port)
+	if (port && strlen(port) > 0)
 	{
 		conn_keywords[i] = "port";
 		conn_values[i] = port;
