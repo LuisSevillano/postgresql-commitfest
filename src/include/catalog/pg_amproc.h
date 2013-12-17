@@ -356,6 +356,13 @@ DATA(insert (	3919   3831 3831 4 3878 ));
 DATA(insert (	3919   3831 3831 5 3879 ));
 DATA(insert (	3919   3831 3831 6 3880 ));
 DATA(insert (	3919   3831 3831 7 3881 ));
+DATA(insert (	4049   869  869  1 4042 ));
+DATA(insert (	4049   869  869  2 4043 ));
+DATA(insert (	4049   869  869  3 4044 ));
+DATA(insert (	4049   869  869  4 4045 ));
+DATA(insert (	4049   869  869  5 4046 ));
+DATA(insert (	4049   869  869  6 4047 ));
+DATA(insert (	4049   869  869  7 4048 ));
 
 
 /* sp-gist */

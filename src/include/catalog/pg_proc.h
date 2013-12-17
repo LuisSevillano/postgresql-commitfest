@@ -2116,6 +2116,26 @@ DATA(insert OID = 927 (  network_sub		PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 1
 DATA(insert OID = 928 (  network_subeq		PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 16 "869 869" _null_ _null_ _null_ _null_	network_subeq _null_ _null_ _null_ ));
 DATA(insert OID = 929 (  network_sup		PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 16 "869 869" _null_ _null_ _null_ _null_	network_sup _null_ _null_ _null_ ));
 DATA(insert OID = 930 (  network_supeq		PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 16 "869 869" _null_ _null_ _null_ _null_	network_supeq _null_ _null_ _null_ ));
+DATA(insert OID = 4040 (  network_overlap	PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 16 "869 869" _null_ _null_ _null_ _null_	network_overlap	_null_ _null_ _null_ ));
+DATA(insert OID = 4041 (  network_adjacent  PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 16 "869 869" _null_ _null_ _null_ _null_	network_adjacent _null_ _null_ _null_ ));
+
+/*
+ * GiST support for inet and cidr
+ */
+DATA(insert OID = 4042 (  inet_gist_consistent PGNSP PGUID 12 1 0 0 0 f f f f t f i 5 0 16 "2281 869 23 26 2281" _null_ _null_ _null_ _null_ inet_gist_consistent _null_ _null_ _null_ ));
+DESCR("GiST support");
+DATA(insert OID = 4043 (  inet_gist_union		PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 2281 "2281 2281" _null_ _null_ _null_ _null_ inet_gist_union _null_ _null_ _null_ ));
+DESCR("GiST support");
+DATA(insert OID = 4044 (  inet_gist_compress	PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 2281 "2281" _null_ _null_ _null_ _null_ inet_gist_compress _null_ _null_ _null_ ));
+DESCR("GiST support");
+DATA(insert OID = 4045 (  inet_gist_decompress PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 2281 "2281" _null_ _null_ _null_ _null_ inet_gist_decompress _null_ _null_ _null_ ));
+DESCR("GiST support");
+DATA(insert OID = 4046 (  inet_gist_penalty	PGNSP PGUID 12 1 0 0 0 f f f f t f i 3 0 2281 "2281 2281 2281" _null_ _null_ _null_ _null_ inet_gist_penalty _null_ _null_ _null_ ));
+DESCR("GiST support");
+DATA(insert OID = 4047 (  inet_gist_picksplit	PGNSP PGUID 12 1 0 0 0 f f f f t f i 2 0 2281 "2281 2281" _null_ _null_ _null_ _null_ inet_gist_picksplit _null_ _null_ _null_ ));
+DESCR("GiST support");
+DATA(insert OID = 4048 (  inet_gist_same		PGNSP PGUID 12 1 0 0 0 f f f f t f i 3 0 2281 "869 869 2281" _null_ _null_ _null_ _null_ inet_gist_same _null_ _null_ _null_ ));
+DESCR("GiST support");
 
 /* inet/cidr functions */
 DATA(insert OID = 598 (  abbrev				PGNSP PGUID 12 1 0 0 0 f f f f t f i 1 0 25 "869" _null_ _null_ _null_ _null_	inet_abbrev _null_ _null_ _null_ ));

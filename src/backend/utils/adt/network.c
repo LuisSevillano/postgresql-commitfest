@@ -23,40 +23,9 @@
 
 
 static int32 network_cmp_internal(inet *a1, inet *a2);
-static int	bitncmp(void *l, void *r, int n);
 static bool addressOK(unsigned char *a, int bits, int family);
 static int	ip_addrsize(inet *inetptr);
 static inet *internal_inetpl(inet *ip, int64 addend);
-
-/*
- *	Access macros.	We use VARDATA_ANY so that we can process short-header
- *	varlena values without detoasting them.  This requires a trick:
- *	VARDATA_ANY assumes the varlena header is already filled in, which is
- *	not the case when constructing a new value (until SET_INET_VARSIZE is
- *	called, which we typically can't do till the end).  Therefore, we
- *	always initialize the newly-allocated value to zeroes (using palloc0).
- *	A zero length word will look like the not-1-byte case to VARDATA_ANY,
- *	and so we correctly construct an uncompressed value.
- *
- *	Note that ip_maxbits() and SET_INET_VARSIZE() require
- *	the family field to be set correctly.
- */
-
-#define ip_family(inetptr) \
-	(((inet_struct *) VARDATA_ANY(inetptr))->family)
-
-#define ip_bits(inetptr) \
-	(((inet_struct *) VARDATA_ANY(inetptr))->bits)
-
-#define ip_addr(inetptr) \
-	(((inet_struct *) VARDATA_ANY(inetptr))->ipaddr)
-
-#define ip_maxbits(inetptr) \
-	(ip_family(inetptr) == PGSQL_AF_INET ? 32 : 128)
-
-#define SET_INET_VARSIZE(dst) \
-	SET_VARSIZE(dst, VARHDRSZ + offsetof(inet_struct, ipaddr) + \
-				ip_addrsize(dst))
 
 
 /*
@@ -596,6 +565,36 @@ network_supeq(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(false);
 }
 
+Datum
+network_overlap(PG_FUNCTION_ARGS)
+{
+	inet	   *a1 = PG_GETARG_INET_PP(0);
+	inet	   *a2 = PG_GETARG_INET_PP(1);
+
+	if (ip_family(a1) == ip_family(a2))
+	{
+		PG_RETURN_BOOL(bitncmp(ip_addr(a1), ip_addr(a2),
+					   Min(ip_bits(a1), ip_bits(a2))) == 0);
+	}
+
+	PG_RETURN_BOOL(false);
+}
+
+Datum
+network_adjacent(PG_FUNCTION_ARGS)
+{
+	inet	   *a1 = PG_GETARG_INET_PP(0);
+	inet	   *a2 = PG_GETARG_INET_PP(1);
+
+	if (ip_family(a1) == ip_family(a2))
+	{
+		PG_RETURN_BOOL(bitncmp(ip_addr(a1), ip_addr(a2),
+					   Min(ip_bits(a1), ip_bits(a2))) != 0);
+	}
+
+	PG_RETURN_BOOL(true);
+}
+
 /*
  * Extract data from a network datatype.
  */
@@ -962,7 +961,7 @@ convert_network_to_scalar(Datum value, Oid typid)
  * author:
  *		Paul Vixie (ISC), June 1996
  */
-static int
+int
 bitncmp(void *l, void *r, int n)
 {
 	u_int		lb,
@@ -989,6 +988,49 @@ bitncmp(void *l, void *r, int n)
 		rb <<= 1;
 	}
 	return 0;
+}
+
+/*
+ * Compare bit masks l and r for n bits
+ *
+ * Return the common bit count from the beginning. In contrast to
+ * it's purpose, it checks the bits from the end to the beggining
+ * to be more effective on modern computers based on the assumption
+ * that the inputs will usually be similar. Additional bits on the
+ * right would not effect the return value as expected. The return
+ * value is always less than the input n.
+ */
+int
+bitncommon(unsigned char *l, unsigned char *r, int n)
+{
+	int			byte,
+				nbits;
+	unsigned char diff;
+
+	byte = n / 8;
+	nbits = n % 8;
+
+	/* Compare bytes from the most to the least */
+	while (byte != 0 && memcmp(l, r, byte) != 0)
+	{
+		byte--;
+
+		/* At least one more bit in the last byte is not common */
+		nbits = 7;
+	}
+
+	/* Set the bits to discard */
+	if (nbits != 0)
+	{
+		/* Set the diff for the first byte which is not common */
+		diff = l[byte] ^ r[byte];
+
+		/* Compare the bits from the most to the least */
+		while (diff >> (8 - nbits) != 0)
+			nbits--;
+	}
+
+	return (8 * byte) + nbits;
 }
 
 static bool

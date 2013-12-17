@@ -82,4 +82,67 @@ typedef struct macaddr
 #define PG_GETARG_MACADDR_P(n) DatumGetMacaddrP(PG_GETARG_DATUM(n))
 #define PG_RETURN_MACADDR_P(x) return MacaddrPGetDatum(x)
 
+/*
+ * Access macros
+ *
+ * We use VARDATA_ANY so that we can process short-header varlena values
+ * without detoasting them. This requires a trick: VARDATA_ANY assumes
+ * the varlena header is already filled in, which is not the case when
+ * constructing a new value (until SET_INET_VARSIZE is called, which we
+ * typically can't do till the end). Therefore, we always initialize
+ * the newly-allocated value to zeroes (using palloc0). A zero length
+ * word look like the not-1-byte case to VARDATA_ANY,  and so we correctly
+ * construct an uncompressed value.
+ *
+ * Note that ip_maxbits() and SET_INET_VARSIZE() require the family
+ * field to be set correctly.
+ */
+
+#define ip_family(inetptr) \
+	(((inet_struct *) VARDATA_ANY(inetptr))->family)
+
+#define ip_bits(inetptr) \
+	(((inet_struct *) VARDATA_ANY(inetptr))->bits)
+
+#define ip_addr(inetptr) \
+	(((inet_struct *) VARDATA_ANY(inetptr))->ipaddr)
+
+#define ip_maxbits(inetptr) \
+	(ip_family(inetptr) == PGSQL_AF_INET ? 32 : 128)
+
+#define SET_INET_VARSIZE(inetptr) \
+	SET_VARSIZE(inetptr, VARHDRSZ + offsetof(inet_struct, ipaddr) + \
+			(ip_family(inetptr) == PGSQL_AF_INET ? 4 : 16))
+
+/*
+ * Operator strategy numbers used in the GiST network opclass
+ */
+#define INETSTRAT_SUB			11
+#define INETSTRAT_SUBEQ			8
+#define INETSTRAT_OVERLAPS		3
+#define INETSTRAT_SUPEQ			7
+#define INETSTRAT_SUP			10
+#define INETSTRAT_LT			16
+#define INETSTRAT_LE			17
+#define INETSTRAT_EQ			18
+#define INETSTRAT_GE			19
+#define INETSTRAT_GT			20
+
+/*
+ * Static functions in network.c
+ */
+extern int		bitncmp(void *l, void *r, int n);
+extern int		bitncommon(unsigned char *l, unsigned char *r, int n);
+
+/*
+ * GiST support functions in network_gist.c
+ */
+extern Datum	inet_gist_consistent(PG_FUNCTION_ARGS);
+extern Datum	inet_gist_compress(PG_FUNCTION_ARGS);
+extern Datum	inet_gist_decompress(PG_FUNCTION_ARGS);
+extern Datum	inet_gist_union(PG_FUNCTION_ARGS);
+extern Datum	inet_gist_penalty(PG_FUNCTION_ARGS);
+extern Datum	inet_gist_picksplit(PG_FUNCTION_ARGS);
+extern Datum	inet_gist_same(PG_FUNCTION_ARGS);
+
 #endif   /* INET_H */

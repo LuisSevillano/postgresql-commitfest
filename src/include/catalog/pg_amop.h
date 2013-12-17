@@ -791,4 +791,18 @@ DATA(insert (	3474   3831 3831 8 s	3892 4000 0 ));
 DATA(insert (	3474   3831 2283 16 s	3889 4000 0 ));
 DATA(insert (	3474   3831 3831 18 s	3882 4000 0 ));
 
+/*
+ * GiST inet_ops
+ */
+DATA(insert (	4049	869	869	3 s		4050 783 0 ));
+DATA(insert (	4049	869	869	7 s		934 783 0 ));
+DATA(insert (	4049	869	869	8 s		932 783 0 ));
+DATA(insert (	4049	869	869	10 s	933 783 0 ));
+DATA(insert (	4049	869	869	11 s	931 783 0 ));
+DATA(insert (	4049	869	869	16 s	1203 783 0 ));
+DATA(insert (	4049	869	869	17 s	1204 783 0 ));
+DATA(insert (	4049	869	869	18 s	1201 783 0 ));
+DATA(insert (	4049	869	869	19 s	1206 783 0 ));
+DATA(insert (	4049	869	869	20 s	1205 783 0 ));
+
 #endif   /* PG_AMOP_H */
