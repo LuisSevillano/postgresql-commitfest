@@ -2265,14 +2265,14 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 			if (pqPutMsgStart('f', false, conn) < 0 ||
 				pqPuts(errormsg, conn) < 0 ||
 				pqPutMsgEnd(conn) < 0)
-				return -1;
+				goto fail;
 		}
 		else
 		{
 			/* Send COPY DONE */
 			if (pqPutMsgStart('c', false, conn) < 0 ||
 				pqPutMsgEnd(conn) < 0)
-				return -1;
+				goto fail;
 		}
 
 		/*
@@ -2283,7 +2283,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 		{
 			if (pqPutMsgStart('S', false, conn) < 0 ||
 				pqPutMsgEnd(conn) < 0)
-				return -1;
+				goto fail;
 		}
 	}
 	else
@@ -2293,7 +2293,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 			/* Ooops, no way to do this in 2.0 */
 			printfPQExpBuffer(&conn->errorMessage,
 							  libpq_gettext("function requires at least protocol version 3.0\n"));
-			return -1;
+			goto fail;
 		}
 		else
 		{
@@ -2301,7 +2301,7 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 			if (pqPutMsgStart(0, false, conn) < 0 ||
 				pqPutnchar("\\.\n", 3, conn) < 0 ||
 				pqPutMsgEnd(conn) < 0)
-				return -1;
+				goto fail;
 		}
 	}
 
@@ -2317,6 +2317,16 @@ PQputCopyEnd(PGconn *conn, const char *errormsg)
 		return -1;
 
 	return 1;
+
+fail:
+
+	/*
+	 * Switch back to BUSY so that PQgetResult will process any unread data
+	 * (typically, a NOTICE message from the backend telling us it's
+	 * committing hara-kiri, and report failure.
+	 */
+	conn->asyncStatus = PGASYNC_BUSY;
+	return -1;
 }
 
 /*
