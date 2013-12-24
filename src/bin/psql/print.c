@@ -124,6 +124,7 @@ const printTextFormat pg_utf8format =
 
 /* Local functions */
 static int	strlen_max_width(unsigned char *str, int *target_width, int encoding);
+static bool IsWrappingNeeded(const printTableContent *cont, bool is_pager);
 static void IsPagerNeeded(const printTableContent *cont, const int extra_lines, bool expanded,
 			  FILE **fout, bool *is_pager);
 
@@ -1234,6 +1235,45 @@ print_aligned_vertical(const printTableContent *cont, FILE *fout)
 			fprintf(fout, "%s\n", cont->title);
 	}
 
+	if (IsWrappingNeeded(cont, is_pager))
+	{
+		int output_columns = 0;
+		/*
+		 * Choose target output width: \pset columns, or $COLUMNS, or ioctl
+		 */
+		if (cont->opt->columns > 0)
+			output_columns = cont->opt->columns;
+		else
+		{
+			if (cont->opt->env_columns > 0)
+				output_columns = cont->opt->env_columns;
+#ifdef TIOCGWINSZ
+			else
+			{
+				struct winsize screen_size;
+
+				if (ioctl(fileno(stdout), TIOCGWINSZ, &screen_size) != -1)
+					output_columns = screen_size.ws_col;
+			}
+#endif
+		}
+
+		output_columns -= hwidth;
+
+		if (opt_border == 0)
+			output_columns -= 1;
+		else
+		{
+			output_columns -= 3; /* -+- */
+
+			if (opt_border > 1)
+				output_columns -= 4; /* +--+ */
+		}
+
+		if ((output_columns > 0) && (dwidth > output_columns))
+			dwidth = output_columns;
+	}
+
 	/* print records */
 	for (i = 0, ptr = cont->cells; *ptr; i++, ptr++)
 	{
@@ -1294,12 +1334,49 @@ print_aligned_vertical(const printTableContent *cont, FILE *fout)
 
 			if (!dcomplete)
 			{
-				if (opt_border < 2)
-					fprintf(fout, "%s\n", dlineptr[line_count].ptr);
+				if (dlineptr[line_count].width > dwidth)
+				{
+					int offset = 0;
+					int chars_to_output = dlineptr[line_count].width;
+					while (chars_to_output > 0)
+					{
+						int target_width, bytes_to_output;
+
+						if (offset > 0)
+						{
+							if (opt_border == 2)
+								fprintf(fout, "%s ", dformat->leftvrule);
+
+							fprintf(fout, "%*s", hwidth, " ");
+
+							if (opt_border > 0)
+								fprintf(fout, " %s ", dformat->midvrule);
+							else
+								fputc(' ', fout);
+						}
+
+						target_width = dwidth;
+						bytes_to_output = strlen_max_width(dlineptr[line_count].ptr + offset,
+															&target_width, encoding);
+						fputnbytes(fout, (char *)(dlineptr[line_count].ptr + offset), bytes_to_output);
+						chars_to_output -= target_width;
+						offset += bytes_to_output;
+
+						if (opt_border < 2)
+							fputc('\n', fout);
+						else
+							fprintf(fout, "%*s %s\n", dwidth - target_width, "", dformat->rightvrule);
+					}
+				}
 				else
-					fprintf(fout, "%-s%*s %s\n", dlineptr[line_count].ptr,
-							dwidth - dlineptr[line_count].width, "",
-							dformat->rightvrule);
+				{
+					if (opt_border < 2)
+						fprintf(fout, "%s\n", dlineptr[line_count].ptr);
+					else
+						fprintf(fout, "%-s%*s %s\n", dlineptr[line_count].ptr,
+								dwidth - dlineptr[line_count].width, "",
+								dformat->rightvrule);
+				}
 
 				if (!dlineptr[line_count + 1].ptr)
 					dcomplete = 1;
@@ -2175,6 +2252,42 @@ print_troff_ms_vertical(const printTableContent *cont, FILE *fout)
 /* Public functions		*/
 /********************************/
 
+/*
+ * IsWrappingNeeded
+ *
+ * Tests if wrapping is needed
+ */
+static bool
+IsWrappingNeeded(const printTableContent *cont,  bool is_pager)
+{
+	const char *pagerprog = 0,
+				*less_options = 0;
+
+	if ((cont->opt->format == PRINT_WRAPPED) || (is_pager == false))
+		return true;
+
+	pagerprog = getenv("PAGER");
+	if (!pagerprog)
+		pagerprog = DEFAULT_PAGER;
+
+	if (strcmp(pagerprog, "less") != 0)
+		return true;
+
+	less_options = getenv("LESS");
+	if (!less_options)
+		return true;
+/*
+ * Test for -S option
+ * Causes  lines  longer than the screen width to be chopped rather
+ * than folded.  That is, the portion of a long line that does  not
+ * fit  in  the  screen width is not shown.  The default is to fold
+ * long lines; that is, display the remainder on the next line.
+ */
+	if (strchr(less_options, 'S'))
+		return false;
+	else
+		return true;
+}
 
 /*
  * PageOutput
