@@ -1203,8 +1203,10 @@ build_aggregate_fnexprs(Oid *agg_input_types,
 						Oid agg_result_type,
 						Oid agg_input_collation,
 						Oid transfn_oid,
+						Oid invtransfn_oid,
 						Oid finalfn_oid,
 						Expr **transfnexpr,
+						Expr **invtransfnexpr,
 						Expr **finalfnexpr)
 {
 	Param	   *argp;
@@ -1248,6 +1250,11 @@ build_aggregate_fnexprs(Oid *agg_input_types,
 						 COERCE_EXPLICIT_CALL);
 	fexpr->funcvariadic = agg_variadic;
 	*transfnexpr = (Expr *) fexpr;
+
+	/* normal aggregates currently don't need inverse transitions */
+	Assert(!OidIsValid(invtransfn_oid));
+
+	*invtransfnexpr = NULL;
 
 	/* see if we have a final function */
 	if (!OidIsValid(finalfn_oid))

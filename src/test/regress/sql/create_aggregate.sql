@@ -101,3 +101,44 @@ alter aggregate my_rank(VARIADIC "any" ORDER BY VARIADIC "any")
   rename to test_rank;
 
 \da test_*
+
+-- inverse transition functions
+CREATE AGGREGATE sumdouble (float8)
+(
+    stype = float8,
+    sfunc = float8pl,
+    invfunc = float8mi
+);
+
+CREATE FUNCTION float8mi_n(float8, float8) RETURNS float8 AS
+$$ SELECT $1 - $2; $$
+LANGUAGE SQL;
+
+CREATE AGGREGATE invalidsumdouble (float8)
+(
+    stype = float8,
+    sfunc = float8pl,
+    invfunc = float8mi_n
+);
+
+CREATE FUNCTION intminus(int, int) RETURNS float8 AS
+$$ SELECT CAST($1 - $2 AS float8); $$
+LANGUAGE SQL;
+
+CREATE AGGREGATE wrongtype (float8)
+(
+    stype = float8,
+    sfunc = float8pl,
+    invfunc = intminus
+);
+
+CREATE FUNCTION float8mi_int(float8, float8) RETURNS int AS
+$$ SELECT CAST($1 - $2 AS INT); $$
+LANGUAGE SQL;
+
+CREATE AGGREGATE wrongreturntype (float8)
+(
+    stype = float8,
+    sfunc = float8pl,
+    invfunc = float8mi_int
+);

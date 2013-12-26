@@ -1763,6 +1763,8 @@ typedef struct WindowAggState
 
 	bool		all_first;		/* true if the scan is starting */
 	bool		all_done;		/* true if the scan is finished */
+	bool		useinvtrans;	/* true if we're able to use inverse
+								 * transition function */
 	bool		partition_spooled;		/* true if all tuples in current
 										 * partition have been spooled into
 										 * tuplestore */

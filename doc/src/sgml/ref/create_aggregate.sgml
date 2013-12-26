@@ -25,6 +25,7 @@ CREATE AGGREGATE <replaceable class="parameter">name</replaceable> ( [ <replacea
     SFUNC = <replaceable class="PARAMETER">sfunc</replaceable>,
     STYPE = <replaceable class="PARAMETER">state_data_type</replaceable>
     [ , SSPACE = <replaceable class="PARAMETER">state_data_size</replaceable> ]
+    [ , INVFUNC = <replaceable class="PARAMETER">inv_trans_func</replaceable> ]
     [ , FINALFUNC = <replaceable class="PARAMETER">ffunc</replaceable> ]
     [ , INITCOND = <replaceable class="PARAMETER">initial_condition</replaceable> ]
     [ , SORTOP = <replaceable class="PARAMETER">sort_operator</replaceable> ]
@@ -47,6 +48,7 @@ CREATE AGGREGATE <replaceable class="PARAMETER">name</replaceable> (
     SFUNC = <replaceable class="PARAMETER">sfunc</replaceable>,
     STYPE = <replaceable class="PARAMETER">state_data_type</replaceable>
     [ , SSPACE = <replaceable class="PARAMETER">state_data_size</replaceable> ]
+    [ , INVFUNC = <replaceable class="PARAMETER">inv_trans_func</replaceable> ]
     [ , FINALFUNC = <replaceable class="PARAMETER">ffunc</replaceable> ]
     [ , INITCOND = <replaceable class="PARAMETER">initial_condition</replaceable> ]
     [ , SORTOP = <replaceable class="PARAMETER">sort_operator</replaceable> ]
@@ -315,6 +317,52 @@ SELECT col FROM tab ORDER BY col USING sortop LIMIT 1;
       in <xref linkend="guc-work-mem">; therefore, large values of this
       parameter discourage use of hash aggregation.
      </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="PARAMETER">inv_trans_func</replaceable></term>
+    <listitem>
+     <para>
+      An inverse transition function can be specified, these can save
+      <productname>PostgreSQL</productname> from having to aggregate values
+      again in certain cases when the aggregate functions is used in the
+      context of a <literal>WINDOW</>. This function should remove the given
+      value from aggregation and restore the state to what it was before the
+      value was aggregated.
+     </para>
+
+     <para>
+      Note that the inverse transition function's return value and arguments
+      must match the return value and arguments of the transition function.
+      The inverse transition function's strict propety must also match the
+      strict property of the transition function.
+     </para>
+
+     <para>
+      <productname>PostgreSQL</productname> uses inverse transition functions
+      with various builtin aggregate functions, for example,
+      <function>count(*)</function>'s inverse transition function simply does
+      <literal>count - 1</> where the transition function does
+      <literal>count + 1</>. Having the inverse transition function in this
+      case saves <productname>PostgreSQL</productname> from having to reiterate
+      over all rows in the window frame to calculate
+      <function>count(*)</function> whenever a row moves out of scope in the
+      window frame.
+     </para>
+
+     <para>
+      Note that <productname>PostgreSQL</productname> will not use inverse
+      transition functions if any other aggregate function in the window frame
+      does not have an inverse transition function set.
+     </para>
+
+     <para>
+      Window functions are described in detail in
+      <xref linkend="tutorial-window">,
+      <xref linkend="syntax-window-functions">, and
+      <xref linkend="queries-window">.
+   </para>
     </listitem>
    </varlistentry>
 

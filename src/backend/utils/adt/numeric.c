@@ -2561,6 +2561,50 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	MemoryContextSwitchTo(old_context);
 }
 
+static void
+do_numeric_discard(NumericAggState *state, Numeric newval)
+{
+	NumericVar	X;
+	NumericVar	X2;
+	MemoryContext old_context;
+
+	/* result is NaN if any processed number is NaN */
+	if (state->isNaN || NUMERIC_IS_NAN(newval))
+	{
+		state->isNaN = true;
+		return;
+	}
+
+	/* load processed number in short-lived context */
+	init_var_from_num(newval, &X);
+
+	/* if we need X^2, calculate that in short-lived context */
+	if (state->calcSumX2)
+	{
+		init_var(&X2);
+		mul_var(&X, &X, &X2, X.dscale * 2);
+	}
+
+	/* The rest of this needs to work in the aggregate context */
+	old_context = MemoryContextSwitchTo(state->agg_context);
+
+	if (state->N-- > 0)
+	{
+		/* Subtract X from state */
+		sub_var(&(state->sumX), &X, &(state->sumX));
+
+		if (state->calcSumX2)
+			sub_var(&(state->sumX2), &X2, &(state->sumX2));
+	}
+	else
+	{
+		MemoryContextSwitchTo(old_context);
+		elog(ERROR, "cannot discard more values than were accumulated");
+	}
+
+	MemoryContextSwitchTo(old_context);
+}
+
 /*
  * Generic transition function for numeric aggregates that require sumX2.
  */
@@ -2583,6 +2627,25 @@ numeric_accum(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(state);
 }
 
+Datum
+numeric_accum_inv(PG_FUNCTION_ARGS)
+{
+	NumericAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		/* Create the state data when we see the first non-null input. */
+		if (state == NULL)
+			state = makeNumericAggState(fcinfo, true);
+
+		do_numeric_discard(state, PG_GETARG_NUMERIC(1));
+	}
+
+	PG_RETURN_POINTER(state);
+}
+
 /*
  * Generic transition function for numeric aggregates that don't require sumX2.
  */
@@ -2600,6 +2663,25 @@ numeric_avg_accum(PG_FUNCTION_ARGS)
 			state = makeNumericAggState(fcinfo, false);
 
 		do_numeric_accum(state, PG_GETARG_NUMERIC(1));
+	}
+
+	PG_RETURN_POINTER(state);
+}
+
+Datum
+numeric_avg_accum_inv(PG_FUNCTION_ARGS)
+{
+	NumericAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		/* Create the state data when we see the first non-null input. */
+		if (state == NULL)
+			state = makeNumericAggState(fcinfo, false);
+
+		do_numeric_discard(state, PG_GETARG_NUMERIC(1));
 	}
 
 	PG_RETURN_POINTER(state);
@@ -2687,6 +2769,82 @@ int8_accum(PG_FUNCTION_ARGS)
 }
 
 /*
+ * inverse transition functions for int2, int4 and int8
+ * which perform the reverse of the above 3 functions
+ */
+Datum
+int2_accum_inv(PG_FUNCTION_ARGS)
+{
+	NumericAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		Numeric		newval;
+
+		newval = DatumGetNumeric(DirectFunctionCall1(int2_numeric,
+			PG_GETARG_DATUM(1)));
+
+		/* Create the state data when we see the first non-null input. */
+		if (state == NULL)
+			state = makeNumericAggState(fcinfo, true);
+
+		do_numeric_discard(state, newval);
+	}
+
+	PG_RETURN_POINTER(state);
+}
+
+Datum
+int4_accum_inv(PG_FUNCTION_ARGS)
+{
+	NumericAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		Numeric		newval;
+
+		newval = DatumGetNumeric(DirectFunctionCall1(int4_numeric,
+			PG_GETARG_DATUM(1)));
+
+		/* Create the state data when we see the first non-null input. */
+		if (state == NULL)
+			state = makeNumericAggState(fcinfo, true);
+
+		do_numeric_discard(state, newval);
+	}
+
+	PG_RETURN_POINTER(state);
+}
+
+Datum
+int8_accum_inv(PG_FUNCTION_ARGS)
+{
+	NumericAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		Numeric		newval;
+
+		newval = DatumGetNumeric(DirectFunctionCall1(int8_numeric,
+			PG_GETARG_DATUM(1)));
+
+		/* Create the state data when we see the first non-null input. */
+		if (state == NULL)
+			state = makeNumericAggState(fcinfo, true);
+
+		do_numeric_discard(state, newval);
+	}
+
+	PG_RETURN_POINTER(state);
+}
+
+/*
  * Transition function for int8 input when we don't need sumX2.
  */
 Datum
@@ -2713,6 +2871,30 @@ int8_avg_accum(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(state);
 }
 
+Datum
+int8_avg_accum_inv(PG_FUNCTION_ARGS)
+{
+	NumericAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		Numeric		newval;
+
+		newval = DatumGetNumeric(DirectFunctionCall1(int8_numeric,
+			PG_GETARG_DATUM(1)));
+
+		/* Create the state data when we see the first non-null input. */
+		if (state == NULL)
+			state = makeNumericAggState(fcinfo, false);
+
+
+		do_numeric_discard(state, newval);
+	}
+
+	PG_RETURN_POINTER(state);
+}
 
 Datum
 numeric_avg(PG_FUNCTION_ARGS)
@@ -2979,6 +3161,61 @@ int2_sum(PG_FUNCTION_ARGS)
 }
 
 Datum
+int2_sum_inv(PG_FUNCTION_ARGS)
+{
+	int64		newval;
+
+	if (PG_ARGISNULL(0))
+	{
+		/* No non-null input seen so far... */
+		if (PG_ARGISNULL(1))
+			PG_RETURN_NULL();	/* still no non-null */
+
+		/*
+		 * This is the first non-null input, so we'll return
+		 * 0 - input. When called as an aggregate function
+		 * this should not happen, but we should probably
+		 * get this right anyway.
+		 */
+		newval = (int64) 0 - PG_GETARG_INT16(1);
+		PG_RETURN_INT64(newval);
+	}
+
+	/*
+	 * If we're invoked as an aggregate, we can cheat and modify our first
+	 * parameter in-place to avoid palloc overhead. If not, we need to return
+	 * the new value of the transition variable. (If int8 is pass-by-value,
+	 * then of course this is useless as well as incorrect, so just ifdef it
+	 * out.)
+	 */
+#ifndef USE_FLOAT8_BYVAL		/* controls int8 too */
+	if (AggCheckCallContext(fcinfo, NULL))
+	{
+		int64	   *oldsum = (int64 *) PG_GETARG_POINTER(0);
+
+		/* Leave the running sum unchanged in the new input is null */
+		if (!PG_ARGISNULL(1))
+			*oldsum = *oldsum - (int64) PG_GETARG_INT16(1);
+
+		PG_RETURN_POINTER(oldsum);
+	}
+	else
+#endif
+	{
+		int64		oldsum = PG_GETARG_INT64(0);
+
+		/* Leave sum unchanged if new input is null. */
+		if (PG_ARGISNULL(1))
+			PG_RETURN_INT64(oldsum);
+
+		/* OK to do the subtraction. */
+		newval = oldsum - (int64) PG_GETARG_INT16(1);
+
+		PG_RETURN_INT64(newval);
+	}
+}
+
+Datum
 int4_sum(PG_FUNCTION_ARGS)
 {
 	int64		newval;
@@ -3026,6 +3263,62 @@ int4_sum(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(newval);
 	}
 }
+
+
+Datum
+int4_sum_inv(PG_FUNCTION_ARGS)
+{
+	int64		newval;
+
+	if (PG_ARGISNULL(0))
+	{
+		/* No non-null input seen so far... */
+		if (PG_ARGISNULL(1))
+			PG_RETURN_NULL();	/* still no non-null */
+
+		/*
+		 * This is the first non-null input, so we'll return
+		 * 0 - input. When called as an aggregate function
+		 * this should not happen, but we should probably
+		 * get this right anyway.
+		 */
+		newval = (int64) 0 - PG_GETARG_INT32(1);
+		PG_RETURN_INT64(newval);
+	}
+	/*
+	 * If we're invoked as an aggregate, we can cheat and modify our first
+	 * parameter in-place to avoid palloc overhead. If not, we need to return
+	 * the new value of the transition variable. (If int8 is pass-by-value,
+	 * then of course this is useless as well as incorrect, so just ifdef it
+	 * out.)
+	 */
+#ifndef USE_FLOAT8_BYVAL		/* controls int8 too */
+	if (AggCheckCallContext(fcinfo, NULL))
+	{
+		int64	   *oldsum = (int64 *) PG_GETARG_POINTER(0);
+
+		/* Leave the running sum unchanged in the new input is null */
+		if (!PG_ARGISNULL(1))
+			*oldsum = *oldsum - (int64) PG_GETARG_INT32(1);
+
+		PG_RETURN_POINTER(oldsum);
+	}
+	else
+#endif
+	{
+		int64		oldsum = PG_GETARG_INT64(0);
+
+		/* Leave sum unchanged if new input is null. */
+		if (PG_ARGISNULL(1))
+			PG_RETURN_INT64(oldsum);
+
+		/* OK to do the subtraction. */
+		newval = oldsum - (int64) PG_GETARG_INT32(1);
+
+		PG_RETURN_INT64(newval);
+	}
+}
+
 
 /*
  * Note: this function is obsolete, it's no longer used for SUM(int8).
@@ -3106,6 +3399,34 @@ int2_avg_accum(PG_FUNCTION_ARGS)
 }
 
 Datum
+int2_avg_accum_inv(PG_FUNCTION_ARGS)
+{
+	ArrayType  *transarray;
+	int16		newval = PG_GETARG_INT16(1);
+	Int8TransTypeData *transdata;
+
+	/*
+	 * If we're invoked as an aggregate, we can cheat and modify our first
+	 * parameter in-place to reduce palloc overhead. Otherwise we need to make
+	 * a copy of it before scribbling on it.
+	 */
+	if (AggCheckCallContext(fcinfo, NULL))
+		transarray = PG_GETARG_ARRAYTYPE_P(0);
+	else
+		transarray = PG_GETARG_ARRAYTYPE_P_COPY(0);
+
+	if (ARR_HASNULL(transarray) ||
+		ARR_SIZE(transarray) != ARR_OVERHEAD_NONULLS(1) + sizeof(Int8TransTypeData))
+		elog(ERROR, "expected 2-element int8 array");
+
+	transdata = (Int8TransTypeData *) ARR_DATA_PTR(transarray);
+	transdata->count--;
+	transdata->sum -= newval;
+
+	PG_RETURN_ARRAYTYPE_P(transarray);
+}
+
+Datum
 int4_avg_accum(PG_FUNCTION_ARGS)
 {
 	ArrayType  *transarray;
@@ -3129,6 +3450,34 @@ int4_avg_accum(PG_FUNCTION_ARGS)
 	transdata = (Int8TransTypeData *) ARR_DATA_PTR(transarray);
 	transdata->count++;
 	transdata->sum += newval;
+
+	PG_RETURN_ARRAYTYPE_P(transarray);
+}
+
+Datum
+int4_avg_accum_inv(PG_FUNCTION_ARGS)
+{
+	ArrayType  *transarray;
+	int32		newval = PG_GETARG_INT32(1);
+	Int8TransTypeData *transdata;
+
+	/*
+	 * If we're invoked as an aggregate, we can cheat and modify our first
+	 * parameter in-place to reduce palloc overhead. Otherwise we need to make
+	 * a copy of it before scribbling on it.
+	 */
+	if (AggCheckCallContext(fcinfo, NULL))
+		transarray = PG_GETARG_ARRAYTYPE_P(0);
+	else
+		transarray = PG_GETARG_ARRAYTYPE_P_COPY(0);
+
+	if (ARR_HASNULL(transarray) ||
+		ARR_SIZE(transarray) != ARR_OVERHEAD_NONULLS(1) + sizeof(Int8TransTypeData))
+		elog(ERROR, "expected 2-element int8 array");
+
+	transdata = (Int8TransTypeData *) ARR_DATA_PTR(transarray);
+	transdata->count--;
+	transdata->sum -= newval;
 
 	PG_RETURN_ARRAYTYPE_P(transarray);
 }

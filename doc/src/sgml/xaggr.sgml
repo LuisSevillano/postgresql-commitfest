@@ -132,6 +132,36 @@ CREATE AGGREGATE avg (float8)
   </note>
 
   <para>
+   An aggregate function can also specify an inverse transition function.
+   <productname>PostgreSQL</productname> can use these when the aggregate
+   is used in the context of a <literal>WINDOW</>, this can save from having to
+   recalculate the aggregate value when a row moves out of the scope of a
+   window frame. Internally <productname>PostgreSQL</productname> uses these
+   for various aggregates functions, this can improve performance significantly
+   even moderate number of rows.
+  </para>
+
+  <para>
+   For safety <productname>PostgreSQL</productname> chooses to omit the inverse
+   transition function in some cases where it might appear that they should be
+   implemented. The <function>sum</> function with the type
+   <literal>double precision</> is an example of this. This is omitted due to
+   the possibility removed rows having an effect on the query results by introducing
+   floating point rounding errors that the records should not be subject to. A fast but
+   unsafe version of <function>sum</l> might be implemented as:
+
+<programlisting>
+CREATE AGGREGATE sumdouble (float8)
+(
+    stype = float8,
+    sfunc = float8pl,
+    invfunc = float8mi
+);
+</programlisting>
+
+  </para>
+
+  <para>
    Aggregate functions can use polymorphic
    state transition functions or final functions, so that the same functions
    can be used to implement multiple aggregates.

@@ -56,6 +56,7 @@ AggregateCreate(const char *aggName,
 				List *parameterDefaults,
 				Oid variadicArgType,
 				List *aggtransfnName,
+				List *agginvtransfnName,
 				List *aggfinalfnName,
 				List *aggsortopName,
 				Oid aggTransType,
@@ -68,11 +69,13 @@ AggregateCreate(const char *aggName,
 	Datum		values[Natts_pg_aggregate];
 	Form_pg_proc proc;
 	Oid			transfn;
+	Oid			invtransfn = InvalidOid; /* can be omitted */
 	Oid			finalfn = InvalidOid;	/* can be omitted */
 	Oid			sortop = InvalidOid;	/* can be omitted */
 	Oid		   *aggArgTypes = parameterTypes->values;
 	bool		hasPolyArg;
 	bool		hasInternalArg;
+	bool		transIsStrict;
 	Oid			rettype;
 	Oid			finaltype;
 	Oid			fnArgs[FUNC_MAX_ARGS];
@@ -234,7 +237,57 @@ AggregateCreate(const char *aggName,
 					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 					 errmsg("must not omit initial value when transition function is strict and transition type is not compatible with input type")));
 	}
+
+	/*
+	 * Remember if trans function is strict as we need to make sure the
+	 * inverse trans function has the same strict setting
+	 */
+	transIsStrict = proc->proisstrict;
+
 	ReleaseSysCache(tup);
+
+	/* handle invtransfn, if supplied */
+	if (agginvtransfnName)
+	{
+		/*
+		 * This must have the same number of arguments with the same types as
+		 * the transition function, so we can just borrow the argument details
+		 * from the transition function and try to find a function with a
+		 * matching signature.
+		 */
+		invtransfn = lookup_agg_function(agginvtransfnName,
+					nargs_transfn, fnArgs, InvalidOid, &rettype);
+
+		/*
+		 * Ensure the return type of the inverse transition function matches
+		 * the expected type.
+		 */
+		if (rettype != aggTransType)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+						errmsg("return type of inverse transition function %s is not %s",
+							NameListToString(agginvtransfnName),
+							format_type_be(aggTransType))));
+
+		tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(invtransfn));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for function %u", invtransfn);
+		proc = (Form_pg_proc) GETSTRUCT(tup);
+
+		/*
+		 * Ensure that the strict setting is the same for the trans and inverse trans
+		 * functions.
+		 */
+		if (proc->proisstrict != transIsStrict)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+						errmsg("inverse transition function must have the same strict setting as the transition function"
+						)));
+		}
+		ReleaseSysCache(tup);
+
+	}
 
 	/* handle finalfn, if supplied */
 	if (aggfinalfnName)
@@ -391,6 +444,7 @@ AggregateCreate(const char *aggName,
 	values[Anum_pg_aggregate_aggkind - 1] = CharGetDatum(aggKind);
 	values[Anum_pg_aggregate_aggnumdirectargs - 1] = Int16GetDatum(numDirectArgs);
 	values[Anum_pg_aggregate_aggtransfn - 1] = ObjectIdGetDatum(transfn);
+	values[Anum_pg_aggregate_agginvtransfn - 1] = ObjectIdGetDatum(invtransfn);
 	values[Anum_pg_aggregate_aggfinalfn - 1] = ObjectIdGetDatum(finalfn);
 	values[Anum_pg_aggregate_aggsortop - 1] = ObjectIdGetDatum(sortop);
 	values[Anum_pg_aggregate_aggtranstype - 1] = ObjectIdGetDatum(aggTransType);
@@ -425,6 +479,15 @@ AggregateCreate(const char *aggName,
 	referenced.objectSubId = 0;
 	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 
+	/* Depends on inverse transition function, if any */
+	if (OidIsValid(invtransfn))
+	{
+		referenced.classId = ProcedureRelationId;
+		referenced.objectId = invtransfn;
+		referenced.objectSubId = 0;
+		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	}
+
 	/* Depends on final function, if any */
 	if (OidIsValid(finalfn))
 	{
@@ -447,7 +510,8 @@ AggregateCreate(const char *aggName,
 }
 
 /*
- * lookup_agg_function -- common code for finding both transfn and finalfn
+ * lookup_agg_function
+ * common code for finding both transfn, invtransfn and finalfn
  */
 static Oid
 lookup_agg_function(List *fnName,
