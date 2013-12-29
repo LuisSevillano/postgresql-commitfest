@@ -318,13 +318,19 @@ ExplainOneQuery(Query *query, IntoClause *into, ExplainState *es,
 		(*ExplainOneQuery_hook) (query, into, es, queryString, params);
 	else
 	{
-		PlannedStmt *plan;
+		PlannedStmt	*plan;
+		instr_time	planstart, planduration;
+
+		INSTR_TIME_SET_CURRENT(planstart);
 
 		/* plan the query */
 		plan = pg_plan_query(query, 0, params);
 
+		INSTR_TIME_SET_CURRENT(planduration);
+		INSTR_TIME_SUBTRACT(planduration, planstart);
+
 		/* run it (if needed) and produce output */
-		ExplainOnePlan(plan, into, es, queryString, params);
+		ExplainOnePlan(plan, into, es, queryString, params, planduration);
 	}
 }
 
@@ -401,7 +407,8 @@ ExplainOneUtility(Node *utilityStmt, IntoClause *into, ExplainState *es,
  */
 void
 ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
-			   const char *queryString, ParamListInfo params)
+			   const char *queryString, ParamListInfo params,
+			   instr_time planduration)
 {
 	DestReceiver *dest;
 	QueryDesc  *queryDesc;
@@ -481,6 +488,17 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 
 	/* Create textual dump of plan tree */
 	ExplainPrintPlan(es, queryDesc);
+
+	if (es->costs)
+	{
+		double plantime = INSTR_TIME_GET_DOUBLE(planduration);
+
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfo(es->str, "Planning time: %.3f ms\n",
+							 1000.0 * plantime);
+		else
+			ExplainPropertyFloat("Planning Time", 1000.0 * plantime, 3, es);
+	}
 
 	/* Print info about runtime of triggers */
 	if (es->analyze)
