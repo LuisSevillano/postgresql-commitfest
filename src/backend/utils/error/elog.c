@@ -1204,6 +1204,23 @@ geterrposition(void)
 }
 
 /*
+ * geterrlevel --- return the currently set error level
+ *
+ * This is only intended for use in error callback subroutines, since there
+ * is no other place outside elog.c where the concept is meaningful.
+ */
+int
+geterrlevel(void)
+{
+	ErrorData  *edata = &errordata[errordata_stack_depth];
+
+	/* we don't bother incrementing recursion_depth */
+	CHECK_STACK_DEPTH();
+
+	return edata->elevel;
+}
+
+/*
  * getinternalerrposition --- same for internal error position
  *
  * This is only intended for use in error callback subroutines, since there

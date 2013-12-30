@@ -2702,9 +2702,11 @@ l1:
 
 		if (infomask & HEAP_XMAX_IS_MULTI)
 		{
+			XactLockTableWaitSetupErrorContextCallback(relation, &tp);
 			/* wait for multixact */
 			MultiXactIdWait((MultiXactId) xwait, MultiXactStatusUpdate,
 							NULL, infomask);
+			XactLockTableWaitCleanupErrorContextCallback();
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 			/*
@@ -2730,7 +2732,10 @@ l1:
 		else
 		{
 			/* wait for regular transaction to end */
+			XactLockTableWaitSetupErrorContextCallback(relation, &tp);
+
 			XactLockTableWait(xwait);
+			XactLockTableWaitCleanupErrorContextCallback();
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 			/*
@@ -3254,9 +3259,11 @@ l2:
 			TransactionId update_xact;
 			int			remain;
 
+			XactLockTableWaitSetupErrorContextCallback(relation, &oldtup);
 			/* wait for multixact */
 			MultiXactIdWait((MultiXactId) xwait, mxact_status, &remain,
 							infomask);
+			XactLockTableWaitCleanupErrorContextCallback();
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 			/*
@@ -3330,7 +3337,10 @@ l2:
 			else
 			{
 				/* wait for regular transaction to end */
+				XactLockTableWaitSetupErrorContextCallback(relation, &oldtup);
+
 				XactLockTableWait(xwait);
+				XactLockTableWaitCleanupErrorContextCallback();
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 				/*
@@ -4398,7 +4408,11 @@ l3:
 										RelationGetRelationName(relation))));
 				}
 				else
+				{
+					XactLockTableWaitSetupErrorContextCallback(relation, tuple);
 					MultiXactIdWait((MultiXactId) xwait, status, NULL, infomask);
+					XactLockTableWaitCleanupErrorContextCallback();
+				}
 
 				/* if there are updates, follow the update chain */
 				if (follow_updates &&
@@ -4453,7 +4467,11 @@ l3:
 										RelationGetRelationName(relation))));
 				}
 				else
+				{
+					XactLockTableWaitSetupErrorContextCallback(relation, tuple);
 					XactLockTableWait(xwait);
+					XactLockTableWaitCleanupErrorContextCallback();
+				}
 
 				/* if there are updates, follow the update chain */
 				if (follow_updates &&
@@ -5139,9 +5157,14 @@ l4:
 
 					if (needwait)
 					{
+						XactLockTableWaitSetupErrorContextCallback(rel, &mytup);
+
 						LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 						XactLockTableWait(members[i].xid);
 						pfree(members);
+
+						XactLockTableWaitCleanupErrorContextCallback();
+
 						goto l4;
 					}
 					if (res != HeapTupleMayBeUpdated)
@@ -5199,8 +5222,13 @@ l4:
 												 &needwait);
 				if (needwait)
 				{
+					XactLockTableWaitSetupErrorContextCallback(rel, &mytup);
+
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					XactLockTableWait(rawxmax);
+
+					XactLockTableWaitCleanupErrorContextCallback();
+
 					goto l4;
 				}
 				if (res != HeapTupleMayBeUpdated)

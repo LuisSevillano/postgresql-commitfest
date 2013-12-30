@@ -1307,7 +1307,11 @@ retry:
 		if (TransactionIdIsValid(xwait))
 		{
 			index_endscan(index_scan);
+
+			XactLockTableWaitSetupErrorContextCallback(heap, tup);
 			XactLockTableWait(xwait);
+			XactLockTableWaitCleanupErrorContextCallback();
+
 			goto retry;
 		}
 
