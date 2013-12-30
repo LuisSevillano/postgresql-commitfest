@@ -1195,13 +1195,19 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 		 */
 		if (log_lock_waits && deadlock_state != DS_NOT_YET_CHECKED)
 		{
-			StringInfoData buf;
+			StringInfoData buf,
+						buf1;
 			const char *modename;
 			long		secs;
 			int			usecs;
 			long		msecs;
+			SHM_QUEUE  *procLocks;
+			PROCLOCK   *proclock;
+			bool		first = true;
+			int			lockHoldersNum = 0;
 
 			initStringInfo(&buf);
+			initStringInfo(&buf1);
 			DescribeLockTag(&buf, &locallock->tag.lock);
 			modename = GetLockmodeName(locallock->tag.lock.locktag_lockmethodid,
 									   lockmode);
@@ -1211,10 +1217,42 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 			msecs = secs * 1000 + usecs / 1000;
 			usecs = usecs % 1000;
 
+			LWLockAcquire(partitionLock, LW_SHARED);
+
+			procLocks = &(lock->procLocks);
+			proclock = (PROCLOCK *) SHMQueueNext(procLocks, procLocks,
+											   offsetof(PROCLOCK, lockLink));
+
+			while (proclock)
+			{
+				if (MyProc->pid != proclock->tag.myProc->pid)
+				{
+					if (first)
+					{
+						appendStringInfo(&buf1, "%d",
+										 proclock->tag.myProc->pid);
+						first = false;
+					}
+					else
+						appendStringInfo(&buf1, ", %d",
+										 proclock->tag.myProc->pid);
+
+					lockHoldersNum++;
+				}
+
+				proclock = (PROCLOCK *) SHMQueueNext(procLocks, &proclock->lockLink,
+											   offsetof(PROCLOCK, lockLink));
+			}
+
+			LWLockRelease(partitionLock);
+
 			if (deadlock_state == DS_SOFT_DEADLOCK)
 				ereport(LOG,
 						(errmsg("process %d avoided deadlock for %s on %s by rearranging queue order after %ld.%03d ms",
-							  MyProcPid, modename, buf.data, msecs, usecs)));
+								MyProcPid, modename, buf.data, msecs, usecs),
+						 (errcontext(ngettext("process owning lock: %s",
+											  "processes owning lock: %s",
+											  lockHoldersNum), buf1.data))));
 			else if (deadlock_state == DS_HARD_DEADLOCK)
 			{
 				/*
@@ -1226,13 +1264,19 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 				 */
 				ereport(LOG,
 						(errmsg("process %d detected deadlock while waiting for %s on %s after %ld.%03d ms",
-							  MyProcPid, modename, buf.data, msecs, usecs)));
+								MyProcPid, modename, buf.data, msecs, usecs),
+						 (errcontext(ngettext("process owning lock: %s",
+											  "processes owning lock: %s",
+											  lockHoldersNum), buf1.data))));
 			}
 
 			if (myWaitStatus == STATUS_WAITING)
 				ereport(LOG,
 						(errmsg("process %d still waiting for %s on %s after %ld.%03d ms",
-							  MyProcPid, modename, buf.data, msecs, usecs)));
+								MyProcPid, modename, buf.data, msecs, usecs),
+						 (errcontext(ngettext("process owning lock: %s",
+											  "processes owning lock: %s",
+											  lockHoldersNum), buf1.data))));
 			else if (myWaitStatus == STATUS_OK)
 				ereport(LOG,
 					(errmsg("process %d acquired %s on %s after %ld.%03d ms",
@@ -1252,7 +1296,10 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 				if (deadlock_state != DS_HARD_DEADLOCK)
 					ereport(LOG,
 							(errmsg("process %d failed to acquire %s on %s after %ld.%03d ms",
-							  MyProcPid, modename, buf.data, msecs, usecs)));
+								MyProcPid, modename, buf.data, msecs, usecs),
+							 (errcontext(ngettext("process owning lock: %s",
+												  "processes owning lock: %s",
+											  lockHoldersNum), buf1.data))));
 			}
 
 			/*
@@ -1262,6 +1309,7 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
 			deadlock_state = DS_NO_DEADLOCK;
 
 			pfree(buf.data);
+			pfree(buf1.data);
 		}
 	} while (myWaitStatus == STATUS_WAITING);
 
