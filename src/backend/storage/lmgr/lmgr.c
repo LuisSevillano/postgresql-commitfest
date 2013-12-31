@@ -18,12 +18,14 @@
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/htup_details.h"
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "utils/inval.h"
-
+#include "utils/lsyscache.h"
+#include "mb/pg_wchar.h"
 
 /*
  * RelationInitLockInfo
@@ -531,6 +533,142 @@ ConditionalXactLockTableWait(TransactionId xid)
 	}
 
 	return true;
+}
+
+static struct {
+	Relation rel;
+	HeapTuple tuple;
+} XactLockTableWaitLockInfos;
+ErrorContextCallback XactLockTableWaitErrorContext;
+
+/*
+ * XactLockTableWaitErrorContextCallback
+ *		error context callback set up by
+ *		XactLockTableWaitSetupErrorContextCallback. It reports some
+ *		tuple information and the relation of a lock to aquire
+ *
+ */
+static void
+XactLockTableWaitErrorContextCallback(void *arg)
+{
+	StringInfoData buf;
+	int i;
+	bool write_comma = false;
+	int maxfieldlen = 30;
+
+	if (XactLockTableWaitLockInfos.rel != NULL)
+	{
+		errcontext("relation name: %s (OID %u)",
+				   RelationGetRelationName(XactLockTableWaitLockInfos.rel),
+				   RelationGetRelid(XactLockTableWaitLockInfos.rel));
+	}
+
+	if (XactLockTableWaitLockInfos.tuple != NULL)
+	{
+		/*
+		 * Can't produce an error message including the tuple if we're in a
+		 * possibly aborted transaction state, database access might not be safe.
+		 */
+		if (geterrlevel() >= ERROR)
+		{
+			errcontext("tuple ctid (%u,%u)",
+					   BlockIdGetBlockNumber(&(XactLockTableWaitLockInfos.tuple->t_self.ip_blkid)),
+					   XactLockTableWaitLockInfos.tuple->t_self.ip_posid);
+		}
+		else
+		{
+			TupleDesc desc = RelationGetDescr(XactLockTableWaitLockInfos.rel);
+			Datum *values = palloc(desc->natts * sizeof(*values));
+			bool *nulls = palloc(desc->natts * sizeof(*values));
+
+			heap_deform_tuple(XactLockTableWaitLockInfos.tuple, desc, values, nulls);
+
+			initStringInfo(&buf);
+			appendStringInfoChar(&buf, '(');
+
+			for (i = 0; i < desc->natts; i++)
+			{
+				char *val;
+				int vallen;
+
+				if (nulls[i])
+					val = "null";
+				else
+				{
+					Oid foutoid;
+					bool typisvarlena;
+
+					getTypeOutputInfo(desc->attrs[i]->atttypid,
+									  &foutoid, &typisvarlena);
+
+					val = OidOutputFunctionCall(foutoid, values[i]);
+				}
+
+				if (write_comma)
+					appendStringInfoString(&buf, ", ");
+				else
+					write_comma = true;
+
+				vallen = strlen(val);
+				if (vallen <= maxfieldlen)
+					appendStringInfoString(&buf, val);
+				else
+				{
+					vallen = pg_mbcliplen(val, vallen, maxfieldlen);
+					appendBinaryStringInfo(&buf, val, vallen);
+					appendStringInfoString(&buf, "...");
+				}
+			}
+
+			appendStringInfoChar(&buf, ')');
+
+			errcontext("tuple (ctid (%u,%u)): %s",
+					   BlockIdGetBlockNumber(&(XactLockTableWaitLockInfos.tuple->t_self.ip_blkid)),
+					   XactLockTableWaitLockInfos.tuple->t_self.ip_posid, buf.data);
+
+			pfree(buf.data);
+			pfree(values);
+			pfree(nulls);
+		}
+	}
+}
+
+/*
+ * XactLockTableWaitSetupErrorContextCallback
+ *		Sets up the error context callback for reporting tuple
+ *		information and relation for a lock to aquire
+ *
+ * Use this before calling XactTableLockWait() or MultiXactIdWait()
+ */
+void
+XactLockTableWaitSetupErrorContextCallback(Relation rel, HeapTuple tuple)
+{
+	/*
+	 * assure that we haven't already set up the same callback
+	 */
+	Assert(XactLockTableWaitLockInfos.rel == NULL);
+
+	XactLockTableWaitLockInfos.rel = rel;
+	XactLockTableWaitLockInfos.tuple = tuple;
+
+	XactLockTableWaitErrorContext.callback = XactLockTableWaitErrorContextCallback;
+	XactLockTableWaitErrorContext.previous = error_context_stack;
+	error_context_stack = &XactLockTableWaitErrorContext;
+}
+
+/*
+ * XactLockTableWaitCleanupErrorContextCallback
+ *		Removes the error callback context
+ *
+ * Use this after calling XactTableLockWait() or MultiXactIdWait()
+ */
+void
+XactLockTableWaitCleanupErrorContextCallback(void)
+{
+	error_context_stack = error_context_stack->previous;
+
+	XactLockTableWaitLockInfos.rel = NULL;
+	XactLockTableWaitLockInfos.tuple = NULL;
 }
 
 /*

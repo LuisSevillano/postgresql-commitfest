@@ -165,7 +165,11 @@ top:
 		{
 			/* Have to wait for the other guy ... */
 			_bt_relbuf(rel, buf);
+
+			XactLockTableWaitSetupErrorContextCallback(rel, NULL);
 			XactLockTableWait(xwait);
+			XactLockTableWaitCleanupErrorContextCallback();
+
 			/* start over... */
 			_bt_freestack(stack);
 			goto top;

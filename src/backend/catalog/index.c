@@ -2297,7 +2297,11 @@ IndexBuildHeapScan(Relation heapRelation,
 							 * Must drop the lock on the buffer before we wait
 							 */
 							LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+
+							XactLockTableWaitSetupErrorContextCallback(heapRelation, heapTuple);
 							XactLockTableWait(xwait);
+							XactLockTableWaitCleanupErrorContextCallback();
+
 							goto recheck;
 						}
 					}
@@ -2343,7 +2347,11 @@ IndexBuildHeapScan(Relation heapRelation,
 							 * Must drop the lock on the buffer before we wait
 							 */
 							LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+
+							XactLockTableWaitSetupErrorContextCallback(heapRelation, heapTuple);
 							XactLockTableWait(xwait);
+							XactLockTableWaitCleanupErrorContextCallback();
+
 							goto recheck;
 						}
 

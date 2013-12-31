@@ -18,6 +18,7 @@
 #include "storage/itemptr.h"
 #include "storage/lock.h"
 #include "utils/rel.h"
+#include "access/htup.h"
 
 
 extern void RelationInitLockInfo(Relation relation);
@@ -56,6 +57,9 @@ extern void XactLockTableInsert(TransactionId xid);
 extern void XactLockTableDelete(TransactionId xid);
 extern void XactLockTableWait(TransactionId xid);
 extern bool ConditionalXactLockTableWait(TransactionId xid);
+
+extern void XactLockTableWaitSetupErrorContextCallback(Relation rel, HeapTuple tuple);
+extern void XactLockTableWaitCleanupErrorContextCallback(void);
 
 /* Lock VXIDs, specified by conflicting locktags */
 extern void WaitForLockers(LOCKTAG heaplocktag, LOCKMODE lockmode);
