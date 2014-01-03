@@ -1594,7 +1594,7 @@ close_SSL(PGconn *conn)
  * return NULL if it doesn't recognize the error code.  We don't
  * want to return NULL ever.
  */
-static char ssl_nomem[] = "out of memory allocating error description";
+static const char ssl_nomem[] = "out of memory allocating error description";
 
 #define SSL_ERR_LEN 128
 
@@ -1607,7 +1607,7 @@ SSLerrmessage(void)
 
 	errbuf = malloc(SSL_ERR_LEN);
 	if (!errbuf)
-		return ssl_nomem;
+		return (char *)ssl_nomem;
 	errcode = ERR_get_error();
 	if (errcode == 0)
 	{
