@@ -48,10 +48,15 @@ typedef struct
 
 static Buffer _bt_newroot(Relation rel, Buffer lbuf, Buffer rbuf);
 
+static void _bt_speccleanup(SpeculativeState *specState);
+static void _bt_insertinitpg(Relation rel, IndexUniqueCheck checkUnique,
+							 ScanKey itup_scankey, Buffer *buf,
+							 BlockNumber *bufblock, BTSpecOpaque btspec);
 static TransactionId _bt_check_unique(Relation rel, IndexTuple itup,
 				 Relation heapRel, Buffer buf, OffsetNumber offset,
 				 ScanKey itup_scankey,
-				 IndexUniqueCheck checkUnique, bool *is_unique);
+				 IndexUniqueCheck checkUnique, bool *is_unique,
+				 ItemPointer dup_htid);
 static void _bt_findinsertloc(Relation rel,
 				  Buffer *bufptr,
 				  OffsetNumber *offsetptr,
@@ -82,55 +87,325 @@ static void _bt_vacuum_one_page(Relation rel, Buffer buffer, Relation heapRel);
 
 
 /*
+ * _bt_speccleanup --- speculative insertion won't proceed callback.
+ *
+ * This is called by the core code when it turns out that an insertion of a
+ * btree index tuple will not proceed, despite the fact that an individual
+ * phased-lock call (the one whose state is passed) believed that it should.
+ *
+ * Sometimes a call that instructs the core code to call this method for each
+ * unique index (or an analogous method for possible other amcanunique access
+ * methods) may come from nbtree itself.
+ *
+ * In general, btree prefers to clean up directly if it is immediately clear
+ * that it is necessary.
+ */
+static void
+_bt_speccleanup(SpeculativeState *specState)
+{
+	BTSpecOpaque	btspec = (BTSpecOpaque) specState->privState;
+	BlockNumber		bufblock = BufferGetBlockNumber(btspec->lockedBuf);
+
+	/* Must unlock leaf page, or risk unprincipled deadlocking */
+	UnlockPage(specState->uniqueIndex, bufblock, ExclusiveLock);
+	/* Drop pin last */
+	ReleaseBuffer(btspec->lockedBuf);
+	/* Unset callback that brought control here (not strictly necessary) */
+	specState->callback = NULL;
+	/* Free private state memory */
+	_bt_freestack(btspec->stack);
+	pfree(btspec->itup);
+	pfree(btspec->itupScankey);
+	pfree(btspec);
+}
+
+/*
+ * _bt_lockinsert() -- Lock values for speculative insertion
+ *
+ *		Obtain an exclusive heavyweight lock on appropriate leaf page, to
+ *		implement a limited form of value locking that prevents concurrent
+ *		insertion of conflicting values for an instant.
+ *
+ *		It is the caller's responsibility to subsequently ask us to release
+ *		value locks (by passing the state back to _bt_doinsert, or perhaps
+ *		through our callback), though we can ask the core code to ask all other
+ *		unique indexes to release just before we wait, and in general we don't
+ *		hold locks if we know insertion will not proceed.
+ *
+ *		specState is passed by the calling indexam proc, but responsibility for
+ *		initializing its fields (with the sole exception of the cached index
+ *		tuple) rests here.  In addition, a list of states of those unique
+ *		indexes participating in speculative insertion that have already
+ *		committed to insertion is passed, in case it proves necessary to
+ *		release values locks on all unique indexes and restart the first stage
+ *		of speculative insertion.
+ */
+void
+_bt_lockinsert(Relation rel, Relation heapRel, SpeculativeState *specState,
+			   List *otherSpecStates, bool priorConflict)
+{
+	int				natts = rel->rd_rel->relnatts;
+	BTSpecOpaque 	btspec = specState->privState;
+	BTPageOpaque 	opaque;
+	ScanKey			itup_scankey;
+	BTStack			stack;
+	bool			is_unique;
+	/* Heavyweight page lock and exclusive buffer lock acquisition avoidance */
+	bool			hwlocked;
+	OffsetNumber	nitems;
+	/* Buffer and pinned page for value locking */
+	Buffer			buf;
+	BlockNumber		bufblock;
+	Page			bufpage;
+	Buffer			presplitbuf;
+	OffsetNumber	offset;
+	TransactionId	xwait;
+
+	/* build insertion scan key */
+	itup_scankey = _bt_mkscankey(rel, btspec->itup);
+	/* find the first page containing this key */
+	stack = _bt_search(rel, natts, itup_scankey, false, &buf, BT_WRITE);
+	/* set up state needed to consider skipping most locking */
+	bufblock = BufferGetBlockNumber(buf);
+	bufpage = BufferGetPage(buf);
+	opaque = (BTPageOpaque) PageGetSpecialPointer(bufpage);
+	nitems = PageGetMaxOffsetNumber(bufpage);
+
+	/*
+	 * Consider trading in our read lock for a write lock.  Checking if the
+	 * value already exists is typically relatively cheap, so the threshold is,
+	 * in a word, low.  If the core code indicated a prior conflict, that means
+	 * that an earlier call here returned recently, having either indicated
+	 * that there was a conflicting xact or a conflicting row.  A recent, known
+	 * conflict against the constant proposed for insertion is by far the most
+	 * compelling reason to apply the optimization.
+	 */
+	if (priorConflict || PageIsFull(bufpage) || nitems > BTREE_PITEMS_NOLOCK)
+	{
+		/*
+		 * Contention indicates that chances are good that a conflicting row
+		 * will be returned (typically to be locked by caller).  Optimistically
+		 * try to find likely duplicate without acquiring hwlock, and without
+		 * swapping read buffer lock for write buffer lock.
+		 */
+		hwlocked = false;
+	}
+	else
+	{
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		/* now lock page of still pinned buffer, and write-lock buffer */
+hwlock:
+		/*
+		 * Lock avoidance optimization did not initially appear promising, or
+		 * has already been unsuccessfully attempted once, or there was a
+		 * concurrent page split
+		 */
+		hwlocked = true;
+		LockPage(rel, bufblock, ExclusiveLock);
+		LockBuffer(buf, BT_WRITE);
+
+		opaque = (BTPageOpaque) PageGetSpecialPointer(BufferGetPage(buf));
+
+		/*
+		 * Consider the need to move right in the tree (see comments at end of
+		 * _bt_insertinitpg), but defend against concurrent page splits by
+		 * retrying.  Respect the general protocol for heavyweight locking
+		 * nbtree pages, which is that pages must be locked before any buffer
+		 * is locked, and released after all buffer locks are released.
+		 */
+		presplitbuf = buf;
+		buf = _bt_moveright(rel, buf, natts, itup_scankey, false, BT_WRITE);
+
+		if (buf != presplitbuf)
+		{
+			/*
+			 * A page split between unlocking and relocking the first page that
+			 * a would-be duplicate value could be on necessitates reacquiring
+			 * all locks.  The existing heavyweight lock is superficially a
+			 * sufficient choke point for value locking against concurrent
+			 * insertions of the value proposed for insertion, but it is
+			 * actually necessary to hold only a single pinned buffer in which
+			 * the heavyweight locked page is allocated, since the page is
+			 * marked as locked with a flag.  When regular inserters that hope
+			 * to mostly avoid heavyweight lock acquisition are considered,
+			 * just holding the existing lock is insufficient, since they rely
+			 * on this flag to indicate that a heavyweight lock may be held by
+			 * another backend on the same buffer's page (actually, we use the
+			 * flag as a hint too).
+			 */
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			UnlockPage(rel, bufblock, ExclusiveLock);
+			bufblock = BufferGetBlockNumber(buf);
+			goto hwlock;
+		}
+	}
+
+	/*
+	 * Indicate that heavyweight lock is held.  The flag bit may already be
+	 * set, due to an aborted transaction setting it without having the
+	 * opportunity to unset it, but this should be rare.
+	 */
+	if (hwlocked)
+		opaque->btpo_flags |= BTP_HAS_LOCK;
+
+	/* get page from buffer */
+	offset = _bt_binsrch(rel, buf, natts, itup_scankey, false);
+
+	/* check for duplicates in a similar fashion to _bt_insert */
+	xwait = _bt_check_unique(rel, btspec->itup, heapRel, buf, offset,
+							 itup_scankey, UNIQUE_CHECK_SPEC, &is_unique,
+							 specState->conflictTid);
+
+	if (TransactionIdIsValid(xwait))
+	{
+		if (hwlocked)
+			opaque->btpo_flags &= ~BTP_HAS_LOCK;
+		_bt_relbuf(rel, buf);
+		if (hwlocked)
+			UnlockPage(rel, bufblock, ExclusiveLock);
+		/* Free all state and amcanunique value locks -- not just our own */
+		index_release(otherSpecStates);
+		_bt_freestack(stack);
+		_bt_freeskey(itup_scankey);
+
+		/*
+		 * Have the core code retry, re-locking any previous unique index
+		 * values as required
+		 */
+		specState->outcome = INSERT_TRY_AGAIN;
+		XactLockTableWait(xwait);
+		return;
+	}
+
+	if (!hwlocked && is_unique)
+	{
+		/*
+		 * A heavyweight page lock is not held.
+		 *
+		 * It was incorrectly predicted that insertion would not proceed.  Now
+		 * that it's clear that it could have safely proceeded if only the
+		 * appropriate locks were held, restart.  This strategy is abandoned
+		 * from here (although when INSERT_TRY_AGAIN is passed back to core
+		 * code, it may later inform this routine that there was a recent
+		 * conflict in respect of the same unique index, which is always
+		 * treated as a valid reason to apply the optimization, even
+		 * repeatedly).
+		 */
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		/*
+		 * Since the buffer lock is now released, it's unlikely though possible
+		 * that upon reacquiring locks suitable for proceeding with insertion,
+		 * insertion will turn out to be unnecessary.
+		 */
+		goto hwlock;
+	}
+
+	/*
+	 * This unique index individually assents to insertion proceeding, or vetos
+	 * insertion from proceeding (though if row locking in the executor later
+	 * fails, all bets are off and a fresh attempt at gaining consensus to
+	 * proceed with "insertion proper" begins)
+	 */
+	specState->outcome = is_unique? INSERT_PROCEED : INSERT_NO_PROCEED;
+	/* Stash stack for insertion proper */
+	btspec->stack = stack;
+	/* Return state to core code */
+	specState->uniqueIndex = rel;
+	btspec->lockedBuf = buf;
+
+	/* Free locks and other state no longer needed as appropriate */
+	if (specState->outcome == INSERT_NO_PROCEED)
+	{
+		/* Release buffer write lock and heavyweight lock here */
+		if (hwlocked)
+			opaque->btpo_flags &= ~BTP_HAS_LOCK;
+		_bt_relbuf(rel, btspec->lockedBuf);
+		if (hwlocked)
+			UnlockPage(rel, bufblock, ExclusiveLock);
+		_bt_freestack(btspec->stack);
+		/* No further release required, except in btlock() */
+		specState->callback = NULL;
+	}
+	else
+	{
+		Assert(hwlocked);
+		/* Unlock buffer, but keep pin and heavyweight lock */
+		LockBuffer(btspec->lockedBuf, BUFFER_LOCK_UNLOCK);
+		/* Cache scankey for second phase too */
+		btspec->itupScankey = itup_scankey;
+		/* Give core code ability to undo/release */
+		specState->callback = _bt_speccleanup;
+	}
+}
+
+/*
  *	_bt_doinsert() -- Handle insertion of a single index tuple in the tree.
  *
- *		This routine is called by the public interface routines, btbuild
- *		and btinsert.  By here, itup is filled in, including the TID.
+ *		This routine is called by the public interface routines, btbuild and
+ *		btinsert.  By here, itup is filled in, including the TID, unlike
+ *		_bt_lockinsert where the heap tuple was not yet inserted (though we
+ *		still use cached itup for speculative insertion).
  *
- *		If checkUnique is UNIQUE_CHECK_NO or UNIQUE_CHECK_PARTIAL, this
- *		will allow duplicates.	Otherwise (UNIQUE_CHECK_YES or
- *		UNIQUE_CHECK_EXISTING) it will throw error for a duplicate.
- *		For UNIQUE_CHECK_EXISTING we merely run the duplicate check, and
- *		don't actually insert.
+ *		If checkUnique is UNIQUE_CHECK_NO or UNIQUE_CHECK_PARTIAL, this will
+ *		allow duplicates.	UNIQUE_CHECK_YES or UNIQUE_CHECK_EXISTING will
+ *		throw errors for a duplicate.  For UNIQUE_CHECK_EXISTING we merely run
+ *		the duplicate check, and don't actually insert.  In the
+ *		UNIQUE_CHECK_SPEC case, a call here represents specualtive "insertion
+ *		proper", with insertion already committed to, so uniqueness checking is
+ *		redundant.
+ *
+ *		specState is state for the speculative insertion locking, and will be
+ *		NULL for regular index tuple inserts.  If speculative insertion reaches
+ *		here, consensus has been reached to proceed and "insertion proper"
+ *		finishing without unique constraint violations is a foregone
+ *		conclusion.
  *
  *		The result value is only significant for UNIQUE_CHECK_PARTIAL:
  *		it must be TRUE if the entry is known unique, else FALSE.
  *		(In the current implementation we'll also return TRUE after a
- *		successful UNIQUE_CHECK_YES or UNIQUE_CHECK_EXISTING call, but
- *		that's just a coding artifact.)
+ *		successful UNIQUE_CHECK_YES, UNIQUE_CHECK_EXISTING or UNIQUE_CHECK_SPEC
+ *		call, but that's just a coding artifact.)
  */
 bool
 _bt_doinsert(Relation rel, IndexTuple itup,
-			 IndexUniqueCheck checkUnique, Relation heapRel)
+			 IndexUniqueCheck checkUnique, Relation heapRel,
+			 SpeculativeState *specState)
 {
 	bool		is_unique = false;
 	int			natts = rel->rd_rel->relnatts;
 	ScanKey		itup_scankey;
 	BTStack		stack;
 	Buffer		buf;
-	OffsetNumber offset;
+	OffsetNumber	offset = InvalidOffsetNumber;
+	BlockNumber		bufblock = InvalidBlockNumber;
+	BTSpecOpaque	btspec = NULL;
 
-	/* we need an insertion scan key to do our search, so build one */
-	itup_scankey = _bt_mkscankey(rel, itup);
-
+	if (checkUnique != UNIQUE_CHECK_SPEC)
+	{
+		/* we need an insertion scan key to do our search, so build one */
+		itup_scankey = _bt_mkscankey(rel, itup);
 top:
-	/* find the first page containing this key */
-	stack = _bt_search(rel, natts, itup_scankey, false, &buf, BT_WRITE);
-
-	offset = InvalidOffsetNumber;
-
-	/* trade in our read lock for a write lock */
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	LockBuffer(buf, BT_WRITE);
+		/* find the first page containing this key */
+		stack = _bt_search(rel, natts, itup_scankey, false, &buf, BT_WRITE);
+	}
+	else
+	{
+		/* retrieve private state */
+		btspec = specState->privState;
+		/* pick up from value locking */
+		itup = btspec->itup;
+		itup_scankey = btspec->itupScankey;
+		stack = btspec->stack;
+		/* this value has already been determined to be unique */
+		is_unique = true;
+	}
 
 	/*
-	 * If the page was split between the time that we surrendered our read
-	 * lock and acquired our write lock, then this page may no longer be the
-	 * right place for the key we want to insert.  In this case, we need to
-	 * move right in the tree.	See Lehman and Yao for an excruciatingly
-	 * precise description.
+	 * Convert read lock (buffer read lock or heavyweight exclusive lock that
+	 * effectively functions as an intent exclusive lock) on first page
+	 * containing this key to write lock as appropriate
 	 */
-	buf = _bt_moveright(rel, buf, natts, itup_scankey, false, BT_WRITE);
+	_bt_insertinitpg(rel, checkUnique, itup_scankey, &buf, &bufblock, btspec);
 
 	/*
 	 * If we're not allowing duplicates, make sure the key isn't already in
@@ -139,32 +414,48 @@ top:
 	 * NOTE: obviously, _bt_check_unique can only detect keys that are already
 	 * in the index; so it cannot defend against concurrent insertions of the
 	 * same key.  We protect against that by means of holding a write lock on
-	 * the target page.  Any other would-be inserter of the same key must
-	 * acquire a write lock on the same target page, so only one would-be
+	 * the target page's buffer.  Any other would-be inserter of the same key
+	 * must acquire a write lock on the same target page, so only one would-be
 	 * inserter can be making the check at one time.  Furthermore, once we are
 	 * past the check we hold write locks continuously until we have performed
-	 * our insertion, so no later inserter can fail to see our insertion.
-	 * (This requires some care in _bt_insertonpg.)
+	 * our insertion, so no later inserter (or, in the analogous point in the
+	 * function _btlock, the undecided speculative inserter) can fail to see
+	 * our insertion  (This requires some care in _bt_insertonpg).  Speculative
+	 * insertion staggers this process, and converts the buffer lock to a page
+	 * heavyweight lock, so that if and when control reaches here, unique
+	 * checking has already been performed, and the right to insert has already
+	 * been established.
 	 *
 	 * If we must wait for another xact, we release the lock while waiting,
 	 * and then must start over completely.
 	 *
 	 * For a partial uniqueness check, we don't wait for the other xact. Just
 	 * let the tuple in and return false for possibly non-unique, or true for
-	 * definitely unique.
+	 * definitely unique.  This work is redundant for speculative insertion,
+	 * and so that case also skips the check, but make sure it got things right
+	 * on assert-enabled builds.
 	 */
-	if (checkUnique != UNIQUE_CHECK_NO)
+	if (
+#ifndef USE_ASSERT_CHECKING
+		checkUnique != UNIQUE_CHECK_SPEC &&
+#endif
+		checkUnique != UNIQUE_CHECK_NO)
 	{
-		TransactionId xwait;
+		TransactionId xwait = InvalidTransactionId;
 
 		offset = _bt_binsrch(rel, buf, natts, itup_scankey, false);
-		xwait = _bt_check_unique(rel, itup, heapRel, buf, offset, itup_scankey,
-								 checkUnique, &is_unique);
 
+		xwait = _bt_check_unique(rel, itup, heapRel, buf, offset, itup_scankey,
+								 checkUnique, &is_unique, NULL);
+
+		Assert(checkUnique != UNIQUE_CHECK_SPEC || is_unique);
 		if (TransactionIdIsValid(xwait))
 		{
 			/* Have to wait for the other guy ... */
 			_bt_relbuf(rel, buf);
+			/* Release heavyweight lock if held */
+			if (bufblock != InvalidBlockNumber)
+				UnlockPage(rel, bufblock, ExclusiveLock);
 			XactLockTableWait(xwait);
 			/* start over... */
 			_bt_freestack(stack);
@@ -192,11 +483,133 @@ top:
 		_bt_relbuf(rel, buf);
 	}
 
+	/* Release heavyweight lock if held */
+	if (bufblock != InvalidBlockNumber)
+		UnlockPage(rel, bufblock, ExclusiveLock);
+
 	/* be tidy */
 	_bt_freestack(stack);
 	_bt_freeskey(itup_scankey);
 
 	return is_unique;
+}
+
+/*
+ *	_bt_insertinitpg() -- Handle insertion's page write lock initialization
+ *
+ * This routine handles minutia relating to how each IndexUniqueCheck case must
+ * lock and unlock buffers, and perhaps the buffer's page.  Some existing type
+ * of lock on *buf is converted to a buffer write lock.
+ *
+ * Caller passes a pinned buffer with the first page the scankey's value could
+ * be on.  The buffer is generally already read locked, though not when the
+ * routine is called as part of the second stage of speculative insertion (i.e.
+ * UNIQUE_CHECK_SPEC), where no buffer lock is held, but rather a heavyweight
+ * exclusive page lock that similarly needs to be correctly converted to a
+ * buffer write lock.  This routine is also tasked with considering the
+ * necessity of acquiring a heavyweight lock, and doing so, for relevant
+ * non-speculative insertion cases.
+ */
+static void
+_bt_insertinitpg(Relation rel, IndexUniqueCheck checkUnique,
+				 ScanKey itup_scankey, Buffer *buf, BlockNumber *bufblock,
+				 BTSpecOpaque btspec)
+{
+	bool			hwlock;
+	int				natts = rel->rd_rel->relnatts;
+	BTPageOpaque 	opaque;
+
+	switch (checkUnique)
+	{
+		case UNIQUE_CHECK_NO:
+		/* Deferred unique constraints don't support speculative insertion */
+		case UNIQUE_CHECK_PARTIAL:
+		case UNIQUE_CHECK_EXISTING:
+			/* trade in our read lock for a write lock */
+			LockBuffer(*buf, BUFFER_LOCK_UNLOCK);
+			LockBuffer(*buf, BT_WRITE);
+
+			/* Break and consider the need to move right. */
+			break;
+		case UNIQUE_CHECK_YES:
+			/*
+			 * The non-speculative unique index tuple insertion case.  As with
+			 * the prior case, some additional initialization is required that
+			 * is already taken care of in the speculative insertion case, but
+			 * unlike that case the implementation must be wary of speculative
+			 * inserters.
+			 */
+			opaque = (BTPageOpaque) PageGetSpecialPointer(BufferGetPage(*buf));
+
+			/* Trade in our read lock for a write lock */
+			hwlock = P_HAS_LOCK(opaque);
+			LockBuffer(*buf, BUFFER_LOCK_UNLOCK);
+			if (hwlock)
+			{
+				/*
+				 * Speculative insertion is underway for this page/buffer, so
+				 * must obtain heavyweight lock to interlock against
+				 * speculative inserters.  Some may be between locking and
+				 * insertion proper for this choke point page/buffer/value, and
+				 * have only a heavyweight lock.
+				 */
+				*bufblock = BufferGetBlockNumber(*buf);
+				LockPage(rel, *bufblock, ExclusiveLock);
+			}
+			LockBuffer(*buf, BT_WRITE);
+
+			/*
+			 * When hwlock held, unset flag, preventing future unnecessary
+			 * hwlock acquisition by this type of inserter
+			 */
+			if (*bufblock != InvalidBlockNumber)
+				opaque->btpo_flags &= ~BTP_HAS_LOCK;
+
+			/*
+			 * Finally, break and consider the need to move right.  When
+			 * speculative insertion is currently treating the page/buffer as a
+			 * choke point, we may move right, but the existing heavyweight
+			 * lock suffices because other non-speculative inserters will block
+			 * on the heavyweight lock now held by this backend.
+			 */
+			break;
+		case UNIQUE_CHECK_SPEC:
+			/*
+			 * Speculative insertion case ("insertion proper").
+			 *
+			 * We already have a heavyweight page lock corresponding to this
+			 * buffer from earlier value locking.  Lock the buffer that the
+			 * page is allocated into, acquiring a buffer lock equivalent to
+			 * the one dropped at the end of value locking.
+			 */
+			LockBuffer(btspec->lockedBuf, BT_WRITE);
+#ifndef USE_ASSERT_CHECKING
+			*buf = btspec->lockedBuf;
+#else
+			*buf = _bt_moveright(rel, btspec->lockedBuf, natts, itup_scankey,
+								 false, BT_WRITE);
+#endif
+			*bufblock = BufferGetBlockNumber(*buf);
+			opaque = (BTPageOpaque) PageGetSpecialPointer(BufferGetPage(*buf));
+			Assert(P_HAS_LOCK(opaque));
+			/*
+			 * Mark the page as no longer heavyweight locked.  From here we can
+			 * rely on buffer locks to ensure no duplicates are inserted.
+			 */
+			opaque->btpo_flags &= ~BTP_HAS_LOCK;
+			/* No break; no need to consider necessity of move to right */
+			Assert(*buf == btspec->lockedBuf);
+			return;
+	}
+
+	/*
+	 * If the page was split between the time that we surrendered our read lock
+	 * and acquired our write lock, then this page may no longer be the right
+	 * place for the key we want to insert.  In this case, we need to move
+	 * right in the tree.	See Lehman and Yao for an excruciatingly precise
+	 * description.
+	 */
+	*buf = _bt_moveright(rel, *buf, natts, itup_scankey, false, BT_WRITE);
 }
 
 /*
@@ -208,7 +621,8 @@ top:
  *
  * Returns InvalidTransactionId if there is no conflict, else an xact ID
  * we must wait for to see if it commits a conflicting tuple.	If an actual
- * conflict is detected, no return --- just ereport().
+ * conflict is detected, return when checkUnique == UNIQUE_CHECK_SPEC.
+ * Otherwise, just ereport().
  *
  * However, if checkUnique == UNIQUE_CHECK_PARTIAL, we always return
  * InvalidTransactionId because we don't want to wait.  In this case we
@@ -218,7 +632,8 @@ top:
 static TransactionId
 _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 				 Buffer buf, OffsetNumber offset, ScanKey itup_scankey,
-				 IndexUniqueCheck checkUnique, bool *is_unique)
+				 IndexUniqueCheck checkUnique, bool *is_unique,
+				 ItemPointer dup_htid)
 {
 	TupleDesc	itupdesc = RelationGetDescr(rel);
 	int			natts = rel->rd_rel->relnatts;
@@ -287,6 +702,9 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 				curitup = (IndexTuple) PageGetItem(page, curitemid);
 				htid = curitup->t_tid;
 
+				if (dup_htid)
+					*dup_htid = htid;
+
 				/*
 				 * If we are doing a recheck, we expect to find the tuple we
 				 * are rechecking.	It's not a duplicate, but we have to keep
@@ -307,6 +725,9 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 										 &all_dead))
 				{
 					TransactionId xwait;
+
+					if (dup_htid)
+						*dup_htid = htid;
 
 					/*
 					 * It is a duplicate. If we are only doing a partial
@@ -334,7 +755,7 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					{
 						if (nbuf != InvalidBuffer)
 							_bt_relbuf(rel, nbuf);
-						/* Tell _bt_doinsert to wait... */
+						/* Tell _bt_doinsert or _bt_lockinsert to wait... */
 						return xwait;
 					}
 
@@ -344,6 +765,16 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					 * is itself now committed dead --- if so, don't complain.
 					 * This is a waste of time in normal scenarios but we must
 					 * do it to support CREATE INDEX CONCURRENTLY.
+					 *
+					 * Naturally, we don't bother with this if there is no
+					 * heap tuple that might have committed dead (as with
+					 * speculative tuple insertion, during value locking).
+					 * Furthermore, in that scenario we don't have to worry
+					 * about this at all during speculative "insertion proper".
+					 * This is because we now know that there never will be a
+					 * heap tuple.  Indeed, there won't even be a real
+					 * insertion (unless row locking fails, in which case all
+					 * bets are off).
 					 *
 					 * We must follow HOT-chains here because during
 					 * concurrent index build, we insert the root TID though
@@ -356,9 +787,18 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					 * entry.
 					 */
 					htid = itup->t_tid;
-					if (heap_hot_search(&htid, heapRel, SnapshotSelf, NULL))
+					if (checkUnique == UNIQUE_CHECK_SPEC ||
+						heap_hot_search(&htid, heapRel, SnapshotSelf, NULL))
 					{
-						/* Normal case --- it's still live */
+						/*
+						 * Normal case --- it's still live, or there is no heap
+						 * tuple pointed to by itup->t_tid to begin with as
+						 * this is speculative insertion value locking.  Note
+						 * that speculative insertion (which is now almost done
+						 * with this attempt at uniqueness verification) will
+						 * not save the NULL heap pointer, but htid is still
+						 * set for the benefit of the case handled here.
+						 */
 					}
 					else
 					{
@@ -375,10 +815,28 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					 * release the buffer locks we're holding ---
 					 * BuildIndexValueDescription could make catalog accesses,
 					 * which in the worst case might touch this same index and
-					 * cause deadlocks.
+					 * cause deadlocks.  Speculative insertion also requires
+					 * that this buffer be released.
 					 */
 					if (nbuf != InvalidBuffer)
 						_bt_relbuf(rel, nbuf);
+
+					*is_unique = false;
+
+					/*
+					 * Done, but don't necessarily raise error.  Where
+					 * applicable, tell caller to report duplicate TID back to
+					 * core code, which may intend to lock it.  Since it's a
+					 * definite conflict TID, no xact to wait on.
+					 */
+					if (checkUnique == UNIQUE_CHECK_SPEC)
+						return InvalidTransactionId;
+
+					/*
+					 * The UNIQUE_CHECK_SPEC case needs the buffer to remain
+					 * locked, but otherwise it must be released lest the
+					 * deadlock scenario described above occur.
+					 */
 					_bt_relbuf(rel, buf);
 
 					{
@@ -956,10 +1414,15 @@ _bt_split(Relation rel, Buffer buf, OffsetNumber firstright,
 
 	isroot = P_ISROOT(oopaque);
 
-	/* if we're splitting this page, it won't be the root when we're done */
-	/* also, clear the SPLIT_END and HAS_GARBAGE flags in both pages */
+	/*
+	 * if we're splitting this page, it won't be the root when we're done.
+	 *
+	 * also, clear the SPLIT_END, HAS_GARBAGE and BTP_HAS_LOCK flags in both
+	 * pages.
+	 */
 	lopaque->btpo_flags = oopaque->btpo_flags;
-	lopaque->btpo_flags &= ~(BTP_ROOT | BTP_SPLIT_END | BTP_HAS_GARBAGE);
+	lopaque->btpo_flags &= ~(BTP_ROOT | BTP_SPLIT_END | BTP_HAS_GARBAGE |
+							 BTP_HAS_LOCK);
 	ropaque->btpo_flags = lopaque->btpo_flags;
 	lopaque->btpo_prev = oopaque->btpo_prev;
 	lopaque->btpo_next = rightpagenumber;

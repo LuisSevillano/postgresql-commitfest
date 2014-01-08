@@ -30,6 +30,7 @@
  *
  *		ExecOpenIndices			\
  *		ExecCloseIndices		 | referenced by InitPlan, EndPlan,
+ *		ExecLockIndexValues		 | (optionally lock indexes first)
  *		ExecInsertIndexTuples	/  ExecInsert, ExecUpdate
  *
  *		RegisterExprContextCallback    Register function shutdown callback
@@ -54,6 +55,8 @@
 
 
 static bool get_last_attnums(Node *node, ProjectionInfo *projInfo);
+static bool ExecCheckPartialPredicate(IndexInfo *info, EState *estate,
+						  ExprContext *econtext);
 static bool index_recheck_constraint(Relation index, Oid *constr_procs,
 						 Datum *existing_values, bool *existing_isnull,
 						 Datum *new_values);
@@ -978,6 +981,232 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 }
 
 /* ----------------------------------------------------------------
+ * ExecCheckPartialPredicate
+ *
+ *		Verify if predicate is satisfied -- if not, callers can skip
+ *		index tuple insertion altogether
+ * ----------------------------------------------------------------
+ */
+static bool
+ExecCheckPartialPredicate(IndexInfo *info, EState *estate,
+						  ExprContext *econtext)
+{
+	List	   *predicate;
+
+	/* No predicate, insertion must be required */
+	if (info->ii_Predicate == NIL)
+		return true;
+
+	/*
+	 * Check for partial index.
+	 *
+	 * If predicate state not set up yet, create it (in the estate's per-query
+	 * context).
+	 */
+	predicate = info->ii_PredicateState;
+	if (predicate == NIL)
+	{
+		predicate = (List *)
+			ExecPrepareExpr((Expr *) info->ii_Predicate,
+							estate);
+		info->ii_PredicateState = predicate;
+	}
+
+	return ExecQual(predicate, econtext, false);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecLockIndexValues
+ *
+ *		Acquire value locks on values that are proposed for insertion
+ *		into unique indexes.  Value locking prevents the concurrent
+ *		insertion of conflicting index tuples into unique indexes.
+ *		This is the first phase of speculative index tuple insertion.
+ *
+ *		Lock values for each unique index such that it is possible to
+ *		commit the core system to inserting a slot without any unique
+ *		index violations, or to inform the core system to not proceed
+ *		with heap insertion at all in respect of this slot.
+ *
+ *		Returns a list of unique indexes that were locked. *conflict
+ *		is set to the index offset of any index on which a conflict
+ *		occurs, if any, and may be read back before being set locally
+ *		to check for previous conflicts.
+ * ----------------------------------------------------------------
+ */
+List *
+ExecLockIndexValues(TupleTableSlot *slot, EState *estate,
+					SpecType spec, int *conflict)
+{
+	ResultRelInfo *resultRelInfo;
+	int			i;
+	int			numIndices;
+	RelationPtr relationDescs;
+	Relation	heapRelation;
+	IndexInfo **indexInfoArray;
+	ExprContext *econtext;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	List	   *result = NIL;
+
+	/*
+	 * Get information from the result relation info structure.
+	 */
+	resultRelInfo = estate->es_result_relation_info;
+	numIndices = resultRelInfo->ri_NumIndices;
+	relationDescs = resultRelInfo->ri_IndexRelationDescs;
+	indexInfoArray = resultRelInfo->ri_IndexRelationInfo;
+	heapRelation = resultRelInfo->ri_RelationDesc;
+
+	/*
+	 * We will use the EState's per-tuple context for evaluating predicates
+	 * and index expressions (creating it if it's not already there).
+	 */
+	econtext = GetPerTupleExprContext(estate);
+
+	/* Arrange for econtext's scan tuple to be the tuple under test */
+	econtext->ecxt_scantuple = slot;
+
+lindex:
+
+	/*
+	 * For each relevant unique index, form and lock the index tuple (this can
+	 * be cached by amcanunique access methods for later use by
+	 * ExecInsertIndexTuples())
+	 *
+	 * We lock the indexes in the opposite order to their usual
+	 * ExecInsertIndexTuples()/release order here.  That routine will
+	 * always insert into the primary key index first, and then any
+	 * unique indexes, before finally inserting into non-unique
+	 * indexes, so as to minimize the window of lock contention,
+	 * particularly for the primary key index.
+	 */
+	for (i = numIndices - 1; i >= 0; i--)
+	{
+		Relation	indexRelation = relationDescs[i];
+		IndexInfo  *indexInfo;
+		SpeculativeState *state;
+
+		if (indexRelation == NULL)
+			continue;
+
+		indexInfo = indexInfoArray[i];
+
+		/* If the index is marked as read-only, ignore it */
+		if (!indexInfo->ii_ReadyForInserts)
+			continue;
+
+		/* Only value lock unique indexes */
+		if (!indexInfo->ii_Unique)
+			continue;
+
+		if (!indexRelation->rd_index->indimmediate)
+		{
+			switch (spec)
+			{
+				case SPEC_IGNORE:
+				case SPEC_IGNORE_REJECTS:
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("unsupported use of ON DUPLICATE KEY IGNORE with deferred unique constraint \"%s\"",
+									RelationGetRelationName(indexRelation)),
+							 errhint("ON DUPLICATE KEY IGNORE implies immediate verification."),
+							 errtableconstraint(heapRelation,
+										   RelationGetRelationName(indexRelation))));
+				case SPEC_UPDATE:
+				case SPEC_UPDATE_REJECTS:
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("unsupported use of ON DUPLICATE KEY LOCK FOR UPDATE with deferred unique constraint \"%s\"",
+									RelationGetRelationName(indexRelation)),
+							 errhint("ON DUPLICATE KEY LOCK FOR UPDATE implies immediate verification."),
+							 errtableconstraint(heapRelation,
+										   RelationGetRelationName(indexRelation))));
+				case SPEC_NONE:		/* Keep compiler quiet */
+					  elog(ERROR, "invalid speculative insertion specification");
+			}
+		}
+
+		if (!ExecCheckPartialPredicate(indexInfo, estate, econtext))
+			continue;
+
+		/*
+		 * FormIndexDatum fills in its values and isnull parameters with the
+		 * appropriate values for the column(s) of the index.
+		 */
+		FormIndexDatum(indexInfo,
+					   slot,
+					   estate,
+					   values,
+					   isnull);
+
+		/*
+		 * The index AM does uniqueness checking.
+		 */
+		state = index_lock(indexRelation,
+						   values,
+						   isnull,
+						   heapRelation,
+						   result,
+						   *conflict == i);
+
+		if (state->outcome == INSERT_TRY_AGAIN)
+		{
+			/*
+			 * AM indicated that we must try again, typically because it had to
+			 * wait pending the outcome of another transaction.
+			 *
+			 * The AM lock function will have already used the list of
+			 * locked-so-far states passed to it to free all locks and other
+			 * resources for all previously locked indexes just before waiting.
+			 *
+			 * The lock starvation hazards here are minimal, since no sensible
+			 * usage of speculative insertion is likely to see conflicts on
+			 * multiple unique indexes at once when row locking (we only really
+			 * concurrently lock all unique index values proposed for insertion
+			 * to save the DML statement's author from specifying which unique
+			 * index they intend to merge on; it will ordinarily be obvious to
+			 * a person with application domain knowledge).  When clients wish
+			 * to avoid a tuple slot's insertion when a duplicate key violation
+			 * would otherwise occur (i.e. IGNORE), only one
+			 * conclusively-present conflict is required to give up, so lock
+			 * starvation is improbable there too.
+			 */
+			list_free(result);
+			result = NIL;
+
+			/* Record conflict, to hint to AM to expect this next time */
+			*conflict = i;
+
+			goto lindex;
+		}
+
+		/*
+		 * Prepend the list, because later stages expect to find the state in
+		 * right-way-around order, and we're working backwards
+		 */
+		result = lcons(state, result);
+
+		/*
+		 * There is no point in proceeding if we already have one would-be
+		 * violation -- we require total consensus
+		 */
+		if (state->outcome == INSERT_NO_PROCEED)
+		{
+			/*
+			 * Record conflict, to hint to AM to expect this if row locking
+			 * ultimately indicates that a full restart is required.  Should
+			 * control once again reach this function, the hint still carries.
+			 */
+			*conflict = i;
+			break;
+		}
+	}
+
+	return result;
+}
+
+/* ----------------------------------------------------------------
  *		ExecInsertIndexTuples
  *
  *		This routine takes care of inserting index tuples
@@ -990,7 +1219,10 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
  *
  *		This returns a list of index OIDs for any unique or exclusion
  *		constraints that are deferred and that had
- *		potential (unconfirmed) conflicts.
+ *		potential (unconfirmed) conflicts.  With speculative
+ *		insertion, successful insertion without unique violations is
+ *		already assured, and specStates allows the second phase to
+ *		perform "insertion proper".
  *
  *		CAUTION: this must not be called for a HOT update.
  *		We can't defend against that here for lack of info.
@@ -1000,11 +1232,13 @@ ExecCloseIndices(ResultRelInfo *resultRelInfo)
 List *
 ExecInsertIndexTuples(TupleTableSlot *slot,
 					  ItemPointer tupleid,
-					  EState *estate)
+					  EState *estate,
+					  List *specStates)
 {
 	List	   *result = NIL;
 	ResultRelInfo *resultRelInfo;
 	int			i;
+	int			sn = 0;
 	int			numIndices;
 	RelationPtr relationDescs;
 	Relation	heapRelation;
@@ -1040,6 +1274,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		IndexInfo  *indexInfo;
 		IndexUniqueCheck checkUnique;
 		bool		satisfiesConstraint;
+		SpeculativeState *state;
 
 		if (indexRelation == NULL)
 			continue;
@@ -1050,38 +1285,22 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		if (!indexInfo->ii_ReadyForInserts)
 			continue;
 
-		/* Check for partial index */
-		if (indexInfo->ii_Predicate != NIL)
-		{
-			List	   *predicate;
+		if (!ExecCheckPartialPredicate(indexInfo, estate, econtext))
+			continue;
 
-			/*
-			 * If predicate state not set up yet, create it (in the estate's
-			 * per-query context)
-			 */
-			predicate = indexInfo->ii_PredicateState;
-			if (predicate == NIL)
-			{
-				predicate = (List *)
-					ExecPrepareExpr((Expr *) indexInfo->ii_Predicate,
-									estate);
-				indexInfo->ii_PredicateState = predicate;
-			}
-
-			/* Skip this index-update if the predicate isn't satisfied */
-			if (!ExecQual(predicate, econtext, false))
-				continue;
-		}
+		state = specStates && indexInfo->ii_Unique ?
+			list_nth(specStates, sn++) : NULL;
 
 		/*
 		 * FormIndexDatum fills in its values and isnull parameters with the
-		 * appropriate values for the column(s) of the index.
+		 * appropriate values for the column(s) of the index, where required.
 		 */
-		FormIndexDatum(indexInfo,
-					   slot,
-					   estate,
-					   values,
-					   isnull);
+		if (!state)
+			FormIndexDatum(indexInfo,
+						   slot,
+						   estate,
+						   values,
+						   isnull);
 
 		/*
 		 * The index AM does the actual insertion, plus uniqueness checking.
@@ -1089,12 +1308,18 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		 * For an immediate-mode unique index, we just tell the index AM to
 		 * throw error if not unique.
 		 *
+		 * For the latter phase of speculative insertion, uniqueness
+		 * checks will already have been performed if we arrive here,
+		 * and should not now be repeated.
+		 *
 		 * For a deferrable unique index, we tell the index AM to just detect
 		 * possible non-uniqueness, and we add the index OID to the result
 		 * list if further checking is needed.
 		 */
 		if (!indexRelation->rd_index->indisunique)
 			checkUnique = UNIQUE_CHECK_NO;
+		else if (specStates)
+			checkUnique = UNIQUE_CHECK_SPEC;
 		else if (indexRelation->rd_index->indimmediate)
 			checkUnique = UNIQUE_CHECK_YES;
 		else
@@ -1106,7 +1331,8 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 						 isnull,	/* null flags */
 						 tupleid,		/* tid of heap tuple */
 						 heapRelation,	/* heap relation */
-						 checkUnique);	/* type of uniqueness check to do */
+						 checkUnique,	/* type of uniqueness check to do */
+						 state);		/* speculative state, if any */
 
 		/*
 		 * If the index has an associated exclusion constraint, check that.

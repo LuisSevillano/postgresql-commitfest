@@ -152,6 +152,119 @@ ExecProcessReturning(ProjectionInfo *projectReturning,
 }
 
 /* ----------------------------------------------------------------
+ * ExecLockHeapTupleForUpdateSpec:  Try to lock tuple for update as
+ * part of speculative insertion.
+ *
+ * Returns value indicating if we're done with heap tuple locking, or
+ * if the executor must start from scratch.
+ * ----------------------------------------------------------------
+ */
+static bool
+ExecLockHeapTupleForUpdateSpec(EState *estate,
+							   ResultRelInfo *relinfo,
+							   ItemPointer tid)
+{
+	Relation				relation = relinfo->ri_RelationDesc;
+	HeapTupleData			tuple;
+	HeapUpdateFailureData 	hufd;
+	HTSU_Result 			test;
+	Buffer					buffer;
+
+	Assert(ItemPointerIsValid(tid));
+
+	/* Lock tuple for update */
+	tuple.t_self = *tid;
+	test = heap_lock_tuple(relation, &tuple,
+						   estate->es_output_cid,
+						   LockTupleExclusive, false, /* wait */
+						   true, &buffer, &hufd);
+	ReleaseBuffer(buffer);
+
+	switch (test)
+	{
+		case HeapTupleInvisible:
+			/* Tuple became invisible;  try again */
+			if (IsolationUsesXactSnapshot())
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update")));
+			return false;
+		case HeapTupleSelfUpdated:
+			/*
+			 * The target tuple was already updated or deleted by the current
+			 * command, or by a later command in the current transaction.  We
+			 * conclude that we're done in the former case, and throw an error
+			 * in the latter case, for the same reasons enumerated in
+			 * ExecUpdate and ExecDelete.
+			 */
+			if (hufd.cmax != estate->es_output_cid)
+				ereport(ERROR,
+						(errcode(ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION),
+						 errmsg("tuple to be updated was already modified by an operation triggered by the current command"),
+						 errhint("Consider using an AFTER trigger instead of a BEFORE trigger to propagate changes to other rows.")));
+
+			/*
+			 * The fact that this command has already updated or deleted the
+			 * tuple is grounds for concluding that we're done.  A Lock will
+			 * already be held (perhaps only a NO KEY UPDATE lock, but that
+			 * seems morally equivalent).  It isn't our responsibility to
+			 * ensure an atomic INSERT-or-UPDATE in the event of a tuple being
+			 * updated or deleted by the same xact in the interim.
+			 */
+			return true;
+		case HeapTupleMayBeUpdated:
+			/*
+			 * Success -- we're done, as tuple is locked.  Verify that the
+			 * tuple is known to be visible to our snapshot under conventional
+			 * MVCC rules if the current isolation level mandates that.  In
+			 * READ COMMITTED mode, a special exception applies to conventional
+			 * MVCC semantics that permits locking a row from a transaction
+			 * that is still in progress according to our snapshot, but higher
+			 * isolation levels cannot avail of that, and must actively defend
+			 * against doing so.
+			 */
+			if (IsolationUsesXactSnapshot() &&
+				XidInClassicMVCCSnapshot(HeapTupleHeaderGetRawXmin(tuple.t_data),
+										 estate->es_snapshot))
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not lock row version originating in still in progress transaction")));
+
+			return true;
+		case HeapTupleUpdated:
+			if (IsolationUsesXactSnapshot())
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update")));
+			/*
+			 * Tell caller to try again from the very start.  We don't use the
+			 * usual EvalPlanQual looping pattern here, fundamentally because
+			 * we don't have a useful qual to verify the next tuple with.
+			 *
+			 * We might devise a means of verifying, by way of binary equality
+			 * in a similar manner to HOT codepaths, if any unique indexed
+			 * columns changed, but this would only serve to ameliorate the
+			 * fundamental problem.  It might well not be good enough, because
+			 * those columns could change too.  It's not clear that doing any
+			 * better here would be worth it.
+			 *
+			 * At this point, all bets are off -- it might actually turn out to
+			 * be okay to proceed with insertion instead of locking now (the
+			 * tuple we attempted to lock could have been deleted, for
+			 * example).  On the other hand, it might not be okay, but for an
+			 * entirely different reason, with an entirely separate TID to
+			 * blame and lock.  This TID may not even be part of the same
+			 * update chain.
+			 */
+			return false;
+		default:
+			elog(ERROR, "unrecognized heap_lock_tuple status: %u", test);
+	}
+
+	return false;
+}
+
+/* ----------------------------------------------------------------
  *		ExecInsert
  *
  *		For INSERT, we have to insert the tuple into the target relation
@@ -164,13 +277,19 @@ static TupleTableSlot *
 ExecInsert(TupleTableSlot *slot,
 		   TupleTableSlot *planSlot,
 		   EState *estate,
-		   bool canSetTag)
+		   bool canSetTag,
+		   SpecType spec)
 {
 	HeapTuple	tuple;
 	ResultRelInfo *resultRelInfo;
 	Relation	resultRelationDesc;
 	Oid			newId;
 	List	   *recheckIndexes = NIL;
+	List	   *specStates = NIL;
+	ProjectionInfo *returning;
+	int			conflict;
+	bool		rejects = (spec == SPEC_IGNORE_REJECTS ||
+						   spec == SPEC_UPDATE_REJECTS);
 
 	/*
 	 * get the heap tuple out of the tuple table slot, making sure we have a
@@ -183,6 +302,7 @@ ExecInsert(TupleTableSlot *slot,
 	 */
 	resultRelInfo = estate->es_result_relation_info;
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
+	returning = resultRelInfo->ri_projectReturning;
 
 	/*
 	 * If the result relation has OIDs, force the tuple's OID to zero so that
@@ -259,6 +379,109 @@ ExecInsert(TupleTableSlot *slot,
 			ExecConstraints(resultRelInfo, slot, estate);
 
 		/*
+		 * For now, if we're performing a speculative insertion, no conflict on
+		 * any particular unique index is considered particularly likely.  As
+		 * and when conflicts emerge for this slot, further future conflicts on
+		 * the same unique index are later anticipated, which is hinted to the
+		 * underlying AM's implementation in ExecLockIndexValues(), to
+		 * facilitate optimizations around lock strength.
+		 */
+		conflict = -1;
+ilock:
+		/*
+		 * Lock unique index values, as required when performing speculative
+		 * insertion
+		 */
+		if (resultRelInfo->ri_NumIndices > 0 && spec != SPEC_NONE)
+			specStates = ExecLockIndexValues(slot, estate, spec, &conflict);
+
+		/*
+		 * Check if it's required to proceed with the second phase ("insertion
+		 * proper") of speculative insertion in respect of the slot.  If
+		 * insertion should not proceed, no firing of AFTER ROW INSERT triggers
+		 * occurs.
+		 *
+		 * We don't suppress the effects (or, perhaps, side-effects) of BEFORE
+		 * ROW INSERT triggers.  This isn't ideal, but then we cannot proceed
+		 * with even considering uniqueness violations until these triggers
+		 * fire on the one hand, but on the other hand they have the ability to
+		 * execute arbitrary user-defined code which may perform operations
+		 * entirely outside the system's ability to nullify.
+		 */
+		if (!index_proceed(specStates))
+		{
+			ItemPointer		htup;
+
+			/*
+			 * Release index value locks -- if insertion had proceeded, this
+			 * would occur during index tuple insertion instead, as each index
+			 * tuple is individually inserted...
+			 */
+			htup = index_release(specStates);
+
+			/*
+			 * ...locks were only needed to ensure that insertion could
+			 * definitely proceed iff that was deemed appropriate.  There is no
+			 * advantage in holding value locks until after row locks are
+			 * acquired, because the locks only prevent insertion of new,
+			 * conflicting values from finishing in other sessions.  Continuing
+			 * to hold locks would not imply that there'd be fewer row locking
+			 * conflicts in ExecLockHeapTupleForUpdateSpec(), plus doing so
+			 * exposes the user to unprincipled deadlocking.
+			 *
+			 * Value locks on indexes can only prevent concurrent unique index
+			 * tuple insertion from completing, but for example UPDATEs will
+			 * still cause conflicts for row locking before value locks have
+			 * the opportunity to block their progress.
+			 */
+			switch (spec)
+			{
+				case SPEC_IGNORE:
+				case SPEC_IGNORE_REJECTS:
+					break;
+				case SPEC_UPDATE:
+				case SPEC_UPDATE_REJECTS:
+					/* Try to lock row for update */
+					if (!ExecLockHeapTupleForUpdateSpec(estate,
+														resultRelInfo,
+														htup))
+					{
+						/*
+						 * Couldn't lock row -- restart from just before value
+						 * locking.  It's subtly wrong to assume anything about
+						 * the row version that is under consideration for
+						 * locking if another transaction updated it first.
+						 */
+						list_free(specStates);
+						goto ilock;
+					}
+					break;
+				case SPEC_NONE:		/* keep compiler quiet */
+					elog(ERROR, "invalid speculative insertion specification");
+			}
+
+			/*
+			 * Consider processing RETURNING, but in respect of the slot now
+			 * rejected by speculative insertion
+			 */
+			if (rejects)
+			{
+				/*
+				 * Misrepresent reject's TID for the benefit of "RETURNING
+				 * REJECTS ctid" projection -- project TID of conflicting
+				 * tuple.  Of course, the reject-returning-slot's tuple doesn't
+				 * actually have a ctid.  This is a convenient, undocumented
+				 * abuse of notation.  Other system columns cannot be
+				 * projected, and requests to do so should not get here.
+				 */
+				slot->tts_tuple->t_self = *htup;
+				return ExecProcessReturning(returning, slot, planSlot);
+			}
+			else
+				return NULL;
+		}
+
+		/*
 		 * insert the tuple
 		 *
 		 * Note: heap_insert returns the tid (location) of the new tuple in
@@ -269,10 +492,14 @@ ExecInsert(TupleTableSlot *slot,
 
 		/*
 		 * insert index entries for tuple
+		 *
+		 * Locks will be acquired if needed, or the locks acquired by
+		 * ExecLockIndexTuples() may be used instead.
 		 */
 		if (resultRelInfo->ri_NumIndices > 0)
 			recheckIndexes = ExecInsertIndexTuples(slot, &(tuple->t_self),
-												   estate);
+												   estate,
+												   specStates);
 	}
 
 	if (canSetTag)
@@ -285,16 +512,19 @@ ExecInsert(TupleTableSlot *slot,
 	/* AFTER ROW INSERT Triggers */
 	ExecARInsertTriggers(estate, resultRelInfo, tuple, recheckIndexes);
 
+	list_free(specStates);
 	list_free(recheckIndexes);
 
 	/* Check any WITH CHECK OPTION constraints */
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(resultRelInfo, slot, estate);
 
-	/* Process RETURNING if present */
-	if (resultRelInfo->ri_projectReturning)
-		return ExecProcessReturning(resultRelInfo->ri_projectReturning,
-									slot, planSlot);
+	/*
+	 * Process RETURNING if present and not only returning speculative
+	 * insertion rejects
+	 */
+	if (returning && !rejects)
+		return ExecProcessReturning(returning, slot, planSlot);
 
 	return NULL;
 }
@@ -781,7 +1011,7 @@ lreplace:;
 		 */
 		if (resultRelInfo->ri_NumIndices > 0 && !HeapTupleIsHeapOnly(tuple))
 			recheckIndexes = ExecInsertIndexTuples(slot, &(tuple->t_self),
-												   estate);
+												   estate, NIL);
 	}
 
 	if (canSetTag)
@@ -1011,7 +1241,8 @@ ExecModifyTable(ModifyTableState *node)
 		switch (operation)
 		{
 			case CMD_INSERT:
-				slot = ExecInsert(slot, planSlot, estate, node->canSetTag);
+				slot = ExecInsert(slot, planSlot, estate, node->canSetTag,
+								  node->spec);
 				break;
 			case CMD_UPDATE:
 				slot = ExecUpdate(tupleid, oldtuple, slot, planSlot,
@@ -1086,6 +1317,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->resultRelInfo = estate->es_result_relations + node->resultRelIndex;
 	mtstate->mt_arowmarks = (List **) palloc0(sizeof(List *) * nplans);
 	mtstate->mt_nplans = nplans;
+	mtstate->spec = node->spec;
 
 	/* set up epqstate with dummy subplan data for the moment */
 	EvalPlanQualInit(&mtstate->mt_epqstate, estate, NULL, NIL, node->epqParam);
@@ -1296,6 +1528,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 				break;
 			case CMD_UPDATE:
 			case CMD_DELETE:
+				Assert(node->spec == SPEC_NONE);
 				junk_filter_needed = true;
 				break;
 			default:

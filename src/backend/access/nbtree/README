@@ -509,6 +509,82 @@ item is irrelevant, and need not be stored at all.  This arrangement
 corresponds to the fact that an L&Y non-leaf page has one more pointer
 than key.
 
+Notes about speculative insertion
+---------------------------------
+
+As an amcanunique AM, the btree implementation is required to support
+"speculative insertion".  This means that the value locking method
+through which unique index enforcement conventionally occurs is
+extended and generalized, such that insertion is staggered:  the core
+code attempts to get full consensus on whether values proposed for
+insertion will not cause duplicate key violations.  Speculative
+insertion is only possible for unique index insertion without deferred
+uniqueness checking (since speculative insertion into a deferred
+unique constraint's index is a contradiction in terms).
+
+For conventional unique index insertion, the Btree implementation
+exclusive locks a buffer holding the first page that the value to be
+inserted could possibly be on, though only for an instant, during and
+shortly after uniqueness verification.  It would not be acceptable to
+hold this lock across complex operations for the duration of the
+remainder of the first phase of speculative insertion.  Therefore, we
+convert this exclusive buffer lock to an exclusive page lock managed
+by the lock manager, thereby greatly ameliorating the consequences of
+undiscovered deadlocking implementation bugs (though deadlocks are not
+expected), and minimizing the impact on system interruptibility, while
+not affecting index scans.
+
+It may be useful to informally think of the page lock type acquired by
+speculative insertion as similar to an intention exclusive lock, a
+type of lock found in some legacy 2PL database systems that use
+multi-granularity locking.  A session establishes the exclusive right
+to subsequently establish a full write lock, without actually blocking
+reads of the page unless and until a lock conversion actually occurs,
+at which point both reads and writes are blocked.  Under this mental
+model, buffer shared locks can be thought of as intention shared
+locks.
+
+As implemented, these heavyweight locks are only relevant to the
+insertion case;  at no other point are they actually considered, since
+insertion is the only way through which new values are introduced.
+The first page a value proposed for insertion into an index could be
+on represents a natural choke point for our extended, though still
+rather limited system of value locking.  Naturally, when we perform a
+"lock escalation" and acquire an exclusive buffer lock, all other
+buffer locks on the same buffer are blocked, which is how the
+implementation localizes knowledge about the heavyweight lock to
+insertion-related routines.  Apart from deletion, which is prevented
+by the fact that we were already holding a pin on the buffer
+throughout, all exclusive locking of Btree buffers happen as a direct
+or indirect result of insertion, so this approach is sufficient.
+(Actually, an exclusive lock may still be acquired without insertion
+to initialize a root page, but that hardly matters.)
+
+Note that all value locks (including buffer pins) are dropped
+immediately as speculative insertion is aborted, as the implementation
+waits on the outcome of another xact, or as "insertion proper" occurs.
+These page-level locks are not intended to last more than an instant.
+In general, the protocol for heavyweight locking Btree pages is that
+heavyweight locks are acquired before any buffer locks are held, while
+the locks are only released after all buffer locks are released.
+While not a hard and fast rule, presently we avoid heavyweight page
+locking more than one page per unique index concurrently.
+
+The core code inserts into indexes in a well-defined order:  Sorted
+ascending by (!indisprimary, !indisunique, OID).  This is a general
+precaution against deadlock hazards in AMs that acquire exclusive
+locks.  However, during the first phase of speculative insertion,
+corresponding locking operations first occur in reverse order (for
+unique indexes only).  This is intended to reduce lock contention, by
+guaranteeing that only heap tuple insertion occurs between value
+locking and index tuple insertion once consensus to proceed emerges,
+while keeping the value locking window shortest of all for the primary
+key index.  Any future expansion to locks persisting past the end of
+an AM call should carefully consider the deadlock hazards.  The
+protocol for releasing value locks is that the core system always does
+so in reverse order to the original locking order (so
+"right-way-around"), regardless of when or why.
+
 Notes to Operator Class Implementors
 ------------------------------------
 

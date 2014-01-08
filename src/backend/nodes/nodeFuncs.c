@@ -1464,6 +1464,9 @@ exprLocation(const Node *expr)
 		case T_WithClause:
 			loc = ((const WithClause *) expr)->location;
 			break;
+		case T_ReturningClause:
+			loc = ((const ReturningClause *) expr)->location;
+			break;
 		case T_CommonTableExpr:
 			loc = ((const CommonTableExpr *) expr)->location;
 			break;
@@ -2954,7 +2957,7 @@ raw_expression_tree_walker(Node *node,
 					return true;
 				if (walker(stmt->selectStmt, context))
 					return true;
-				if (walker(stmt->returningList, context))
+				if (walker(stmt->rlist, context))
 					return true;
 				if (walker(stmt->withClause, context))
 					return true;
@@ -2970,7 +2973,7 @@ raw_expression_tree_walker(Node *node,
 					return true;
 				if (walker(stmt->whereClause, context))
 					return true;
-				if (walker(stmt->returningList, context))
+				if (walker(stmt->rlist, context))
 					return true;
 				if (walker(stmt->withClause, context))
 					return true;
@@ -2988,7 +2991,7 @@ raw_expression_tree_walker(Node *node,
 					return true;
 				if (walker(stmt->fromClause, context))
 					return true;
-				if (walker(stmt->returningList, context))
+				if (walker(stmt->rlist, context))
 					return true;
 				if (walker(stmt->withClause, context))
 					return true;
@@ -3183,6 +3186,8 @@ raw_expression_tree_walker(Node *node,
 			break;
 		case T_WithClause:
 			return walker(((WithClause *) node)->ctes, context);
+		case T_ReturningClause:
+			return walker(((ReturningClause *) node)->returningList, context);
 		case T_CommonTableExpr:
 			return walker(((CommonTableExpr *) node)->ctequery, context);
 		default:

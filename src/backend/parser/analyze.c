@@ -61,7 +61,8 @@ static Node *transformSetOperationTree(ParseState *pstate, SelectStmt *stmt,
 static void determineRecursiveColTypes(ParseState *pstate,
 						   Node *larg, List *nrtargetlist);
 static Query *transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt);
-static List *transformReturningList(ParseState *pstate, List *returningList);
+static List *transformReturningClause(ParseState *pstate, ReturningClause *returningList,
+						   bool *rejects);
 static Query *transformDeclareCursorStmt(ParseState *pstate,
 						   DeclareCursorStmt *stmt);
 static Query *transformExplainStmt(ParseState *pstate,
@@ -344,6 +345,7 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	Query	   *qry = makeNode(Query);
 	ParseNamespaceItem *nsitem;
 	Node	   *qual;
+	bool		rejects;
 
 	qry->commandType = CMD_DELETE;
 
@@ -384,12 +386,20 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
 
-	qry->returningList = transformReturningList(pstate, stmt->returningList);
+	qry->returningList = transformReturningClause(pstate, stmt->rlist, &rejects);
+
+	if (rejects)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("RETURNING clause does not accept REJECTS for DELETE statements"),
+				 parser_errposition(pstate,
+									exprLocation((Node *) stmt->rlist))));
 
 	/* done building the range table and jointree */
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
 
+	qry->specClause = SPEC_NONE;
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
 	qry->hasAggs = pstate->p_hasAggs;
@@ -410,6 +420,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 {
 	Query	   *qry = makeNode(Query);
 	SelectStmt *selectStmt = (SelectStmt *) stmt->selectStmt;
+	SpecType	spec = stmt->specClause;
 	List	   *exprList = NIL;
 	bool		isGeneralSelect;
 	List	   *sub_rtable;
@@ -421,6 +432,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	ListCell   *icols;
 	ListCell   *attnos;
 	ListCell   *lc;
+	bool		rejects = false;
 
 	/* There can't be any outer WITH to worry about */
 	Assert(pstate->p_ctenamespace == NIL);
@@ -748,19 +760,34 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	 * RETURNING will work.  Also, remove any namespace entries added in a
 	 * sub-SELECT or VALUES list.
 	 */
-	if (stmt->returningList)
+	if (stmt->rlist)
 	{
 		pstate->p_namespace = NIL;
 		addRTEtoQuery(pstate, pstate->p_target_rangetblentry,
 					  false, true, true);
-		qry->returningList = transformReturningList(pstate,
-													stmt->returningList);
+		qry->returningList = transformReturningClause(pstate,
+													stmt->rlist, &rejects);
 	}
 
 	/* done building the range table and jointree */
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
 
+	/* Normalize speculative insertion specification */
+	if (rejects)
+	{
+		if (spec == SPEC_IGNORE)
+			spec = SPEC_IGNORE_REJECTS;
+		else if (spec == SPEC_UPDATE)
+			spec = SPEC_UPDATE_REJECTS;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("RETURNING clause with REJECTS can only appear when ON DUPLICATE KEY was also specified"),
+					 parser_errposition(pstate,
+										exprLocation((Node *) stmt->rlist))));
+	}
+	qry->specClause = spec;
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 
 	assign_query_collations(pstate, qry);
@@ -1008,6 +1035,7 @@ transformSelectStmt(ParseState *pstate, SelectStmt *stmt)
 
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
+	qry->specClause = SPEC_NONE;
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 	qry->hasWindowFuncs = pstate->p_hasWindowFuncs;
@@ -1905,6 +1933,7 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	Node	   *qual;
 	ListCell   *origTargetList;
 	ListCell   *tl;
+	bool		rejects;
 
 	qry->commandType = CMD_UPDATE;
 	pstate->p_is_update = true;
@@ -1943,10 +1972,19 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
 
-	qry->returningList = transformReturningList(pstate, stmt->returningList);
+	qry->returningList = transformReturningClause(pstate, stmt->rlist,
+												&rejects);
+
+	if (rejects)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("RETURNING clause does not accept REJECTS for UPDATE statements"),
+				 parser_errposition(pstate,
+									exprLocation((Node *) stmt->rlist))));
 
 	qry->rtable = pstate->p_rtable;
 	qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
+	qry->specClause = SPEC_NONE;
 
 	qry->hasSubLinks = pstate->p_hasSubLinks;
 
@@ -2016,17 +2054,23 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 }
 
 /*
- * transformReturningList -
+ * transformReturningClause -
  *	handle a RETURNING clause in INSERT/UPDATE/DELETE
  */
 static List *
-transformReturningList(ParseState *pstate, List *returningList)
+transformReturningClause(ParseState *pstate, ReturningClause *clause,
+					   bool *rejects)
 {
-	List	   *rlist;
+	List	   *tlist, *rlist;
 	int			save_next_resno;
 
-	if (returningList == NIL)
-		return NIL;				/* nothing to do */
+	if (clause == NULL)
+	{
+		*rejects = false;
+		return NIL;
+	}
+
+	rlist = clause->returningList;
 
 	/*
 	 * We need to assign resnos starting at one in the RETURNING list. Save
@@ -2037,7 +2081,33 @@ transformReturningList(ParseState *pstate, List *returningList)
 	pstate->p_next_resno = 1;
 
 	/* transform RETURNING identically to a SELECT targetlist */
-	rlist = transformTargetList(pstate, returningList, EXPR_KIND_RETURNING);
+	tlist = transformTargetList(pstate, rlist, EXPR_KIND_RETURNING);
+
+	/* Cannot accept system column Vars when returning rejects */
+	if (clause->rejects)
+	{
+		ListCell *l;
+
+		foreach(l, tlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(l);
+			Var *var = (Var *) tle->expr;
+
+			if (var->varattno <= 0 &&
+				var->varattno != -1)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("RETURNING clause cannot return most system columns when REJECTS is specified"),
+						 errdetail("Only the ctid column may be specified, to indicate conflicting ctid."),
+						 parser_errposition(pstate,
+											exprLocation((Node *) var))));
+			}
+		}
+	}
+
+	/* pass on if we return rejects */
+	*rejects = clause->rejects;
 
 	/*
 	 * Complain if the nonempty tlist expanded to nothing (which is possible
@@ -2050,15 +2120,15 @@ transformReturningList(ParseState *pstate, List *returningList)
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("RETURNING must have at least one column"),
 				 parser_errposition(pstate,
-									exprLocation(linitial(returningList)))));
+									exprLocation(linitial(rlist)))));
 
 	/* mark column origins */
-	markTargetListOrigins(pstate, rlist);
+	markTargetListOrigins(pstate, tlist);
 
 	/* restore state */
 	pstate->p_next_resno = save_next_resno;
 
-	return rlist;
+	return tlist;
 }
 
 

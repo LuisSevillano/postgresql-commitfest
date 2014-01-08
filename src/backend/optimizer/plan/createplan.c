@@ -4719,7 +4719,7 @@ make_modifytable(PlannerInfo *root,
 				 CmdType operation, bool canSetTag,
 				 List *resultRelations, List *subplans,
 				 List *withCheckOptionLists, List *returningLists,
-				 List *rowMarks, int epqParam)
+				 List *rowMarks, SpecType spec, int epqParam)
 {
 	ModifyTable *node = makeNode(ModifyTable);
 	Plan	   *plan = &node->plan;
@@ -4771,6 +4771,7 @@ make_modifytable(PlannerInfo *root,
 	node->withCheckOptionLists = withCheckOptionLists;
 	node->returningLists = returningLists;
 	node->rowMarks = rowMarks;
+	node->spec = spec;
 	node->epqParam = epqParam;
 
 	/*

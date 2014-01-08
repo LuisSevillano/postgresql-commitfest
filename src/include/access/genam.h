@@ -102,15 +102,84 @@ typedef struct SysScanDescData *SysScanDesc;
  * call is made with UNIQUE_CHECK_EXISTING.  The tuple is already in the
  * index in this case, so it should not be inserted again.	Rather, just
  * check for conflicting live tuples (possibly blocking).
+ *
+ * INSERT...ON DUPLICATE KEY IGNORE/LOCK FOR UPDATE operations involve
+ * "speculative" insertion of tuples.  There is a call to establish the
+ * uniqueness of a tuple and take appropriate value locks (once per unique
+ * index per table slot).  These locks prevent concurrent insertion of
+ * conflicting key values, and will only be held for an instant.  Subsequently,
+ * there may be a second, corresponding phase where insertion actually occurs.
+ * Then, the potential index_insert() calls are made with UNIQUE_CHECK_SPEC.
+ * However, even when speculative insertion is requested, non-unique indexes
+ * only perform insertion in the second phase, in the conventional manner,
+ * because UNIQUE_CHECK_NO is passed to the AM.
  */
 typedef enum IndexUniqueCheck
 {
 	UNIQUE_CHECK_NO,			/* Don't do any uniqueness checking */
 	UNIQUE_CHECK_YES,			/* Enforce uniqueness at insertion time */
 	UNIQUE_CHECK_PARTIAL,		/* Test uniqueness, but no error */
-	UNIQUE_CHECK_EXISTING		/* Check if existing tuple is unique */
+	UNIQUE_CHECK_EXISTING,		/* Check if existing tuple is unique */
+	UNIQUE_CHECK_SPEC			/* Speculative phased locking insertion */
 } IndexUniqueCheck;
 
+/*
+ * For speculative insertion's phased locking, it is necessary for the core
+ * system to have callbacks to amcanunique AMs that allow them to clean-up in
+ * the duplicate found case.  This is because one first-phase call in respect
+ * of some unique index might indicate that it's okay to proceed, while another
+ * such call relating to another unique index (but the same executor-level
+ * tuple slot) indicates that it is not.  In general, we cannot rely on
+ * actually reaching the second phase even if some check in the first phase
+ * says that it thinks insertion ought to proceed, because we need total
+ * consensus from all unique indexes that may be inserted into as part of
+ * proceeding with inserting the tuple slot.
+ *
+ * It is the responsibility of supporting AMs to set the callback if there is
+ * clean-up to be done when not proceeding.	 Note, however, that the executor
+ * will not call the callback if insertion of the relevant index tuple
+ * proceeds, because the AM should take care of this itself in the second,
+ * final, optional step ("insertion proper").
+ */
+struct SpeculativeState;
+typedef void (*ReleaseIndexCallback) (struct SpeculativeState *state);
+
+/*
+ * Speculative status returned.
+ *
+ * It may be necessary to start the first phase of speculative insertion from
+ * scratch, in the event of needing to block pending the completion of another
+ * transaction, where the AM cannot reasonably sit on value locks (associated
+ * with some other, previously locked amcanunique indexes) indefinitely.
+ */
+typedef enum
+{
+	INSERT_TRY_AGAIN,	/* had xact conflict - restart from first index */
+	INSERT_NO_PROCEED,	/* duplicate conclusively found */
+	INSERT_PROCEED		/* no duplicate key in any index */
+} SpecStatus;
+
+/*
+ * Struct representing state passed to and from clients for speculative phased
+ * insertion.  This is allocated by amcanunique access methods, and passed back
+ * and forth for phased index locking.
+ *
+ * There is one such piece of state associated with every unique index
+ * participating in insertion of a slot.
+ */
+typedef struct SpeculativeState
+{
+	/* Index under consideration */
+	Relation				uniqueIndex;
+	/* Opaque amcanunique state */
+	void				   *privState;
+	/* Callback to tell AM to clean-up */
+	ReleaseIndexCallback	callback;
+	/* Outcome of first phase (current attempt) for uniqueIndex */
+	SpecStatus				outcome;
+	/* Conflicting heap tuple, if any */
+	ItemPointer				conflictTid;
+}	SpeculativeState;
 
 /*
  * generalized index_ interface routines (in indexam.c)
@@ -129,7 +198,16 @@ extern bool index_insert(Relation indexRelation,
 			 Datum *values, bool *isnull,
 			 ItemPointer heap_t_ctid,
 			 Relation heapRelation,
-			 IndexUniqueCheck checkUnique);
+			 IndexUniqueCheck checkUnique,
+			 SpeculativeState * state);
+extern SpeculativeState *index_lock(Relation indexRelation,
+		   Datum *values,
+		   bool *isnull,
+		   Relation heapRelation,
+		   List *otherSpecStates,
+		   bool priorConflict);
+extern bool index_proceed(List *specStates);
+extern ItemPointer index_release(List *specStates);
 
 extern IndexScanDesc index_beginscan(Relation heapRelation,
 				Relation indexRelation,

@@ -73,6 +73,7 @@ typedef BTPageOpaqueData *BTPageOpaque;
 #define BTP_HALF_DEAD	(1 << 4)	/* empty, but still in tree */
 #define BTP_SPLIT_END	(1 << 5)	/* rightmost page of split group */
 #define BTP_HAS_GARBAGE (1 << 6)	/* page has LP_DEAD tuples */
+#define BTP_HAS_LOCK	(1 << 7)	/* page has heavyweight lock */
 
 /*
  * The max allowed value of a cycle ID is a bit less than 64K.	This is
@@ -131,6 +132,26 @@ typedef struct BTMetaPageData
 #define BTREE_NONLEAF_FILLFACTOR	70
 
 /*
+ * Specify a number of items on leaf page, representing a threshold after which
+ * speculative insertion prefers to attempt lock avoidance first.
+ *
+ * This value may seem suspect, because it does not account for btree leaf
+ * fillfactor, nor BLCKSZ;  in general it does not carefully consider how many
+ * items present on a leaf page meet some particular definition of "almost
+ * full", and therefore that a value proposed for insertion is likely to be
+ * found rather than newly inserted.  Perhaps most woolly of all, the page
+ * under consideration may not be the only page inspected for a would-be
+ * duplicate.  The value is only intended as a very rough approximation of the
+ * tipping point at which the optimization becomes profitable, and there are
+ * other, more important factors that will frequently independently make the
+ * optimization applicable.  This value is thought to frequently exclude btree
+ * pages with larger tuples, where associated operators/types may have
+ * relatively expensive comparison operations, a cost with the potential to
+ * dominate.
+ */
+#define BTREE_PITEMS_NOLOCK			150
+
+/*
  *	Test whether two btree entries are "the same".
  *
  *	Old comments:
@@ -178,6 +199,7 @@ typedef struct BTMetaPageData
 #define P_ISHALFDEAD(opaque)	((opaque)->btpo_flags & BTP_HALF_DEAD)
 #define P_IGNORE(opaque)		((opaque)->btpo_flags & (BTP_DELETED|BTP_HALF_DEAD))
 #define P_HAS_GARBAGE(opaque)	((opaque)->btpo_flags & BTP_HAS_GARBAGE)
+#define P_HAS_LOCK(opaque)		((opaque)->btpo_flags & BTP_HAS_LOCK)
 
 /*
  *	Lehman and Yao's algorithm requires a ``high key'' on every non-rightmost
@@ -583,6 +605,28 @@ typedef struct BTScanOpaqueData
 typedef BTScanOpaqueData *BTScanOpaque;
 
 /*
+ * BTSpecOpaqueStateData is the btree-private state that is managed as part of
+ * speculative index tuple insertion, particular to this implementation.  In
+ * the first phase, the implementation stashes this private state.  The state
+ * is passed back during the second phase, or resources are freed using a
+ * callback.
+ *
+ * lockedBuf is always pinned when passed back to the caller at the end of the
+ * first phase, unless the current attempt to get consensus was unsuccessful.
+ * An exlusive heavyweight lock will also be held on the page which lockedBuf
+ * is allocated into.
+ */
+typedef struct BTSpecOpaqueData
+{
+	Buffer		lockedBuf;		/* Buffer whose page (a leaf page) is locked */
+	BTStack		stack;			/* Saved stack in case of page split */
+	IndexTuple	itup;			/* Cached index tuple */
+	ScanKey		itupScankey;	/* Cached insertion scankey - redundant */
+} BTSpecOpaqueData;
+
+typedef BTSpecOpaqueData *BTSpecOpaque;
+
+/*
  * We use some private sk_flags bits in preprocessed scan keys.  We're allowed
  * to use bits 16-31 (see skey.h).	The uppermost bits are copied from the
  * index's indoption[] array entry for the index attribute.
@@ -598,6 +642,7 @@ typedef BTScanOpaqueData *BTScanOpaque;
  */
 extern Datum btbuild(PG_FUNCTION_ARGS);
 extern Datum btbuildempty(PG_FUNCTION_ARGS);
+extern Datum btlock(PG_FUNCTION_ARGS);
 extern Datum btinsert(PG_FUNCTION_ARGS);
 extern Datum btbeginscan(PG_FUNCTION_ARGS);
 extern Datum btgettuple(PG_FUNCTION_ARGS);
@@ -614,8 +659,12 @@ extern Datum btoptions(PG_FUNCTION_ARGS);
 /*
  * prototypes for functions in nbtinsert.c
  */
+extern void _bt_lockinsert(Relation rel, Relation heapRel,
+			 SpeculativeState *specState, List *otherSpecStates,
+			 bool priorConflict);
 extern bool _bt_doinsert(Relation rel, IndexTuple itup,
-			 IndexUniqueCheck checkUnique, Relation heapRel);
+			 IndexUniqueCheck checkUnique, Relation heapRel,
+			 SpeculativeState *specState);
 extern Buffer _bt_getstackbuf(Relation rel, BTStack stack, int access);
 extern void _bt_insert_parent(Relation rel, Buffer buf, Buffer rbuf,
 				  BTStack stack, bool is_root, bool is_only);

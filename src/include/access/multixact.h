@@ -86,6 +86,7 @@ extern MultiXactId MultiXactIdCreateFromMembers(int nmembers,
 
 extern MultiXactId ReadNextMultiXactId(void);
 extern bool MultiXactIdIsRunning(MultiXactId multi);
+extern bool MultiXactIdAmMember(MultiXactId multi);
 extern void MultiXactIdSetOldestMember(void);
 extern int GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **xids,
 					  bool allow_old);

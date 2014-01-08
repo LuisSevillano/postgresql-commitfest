@@ -18,8 +18,12 @@
  *		index_rescan	- restart a scan of an index
  *		index_endscan	- end a scan
  *		index_insert	- insert an index tuple into a relation
+ *		index_lock		- lock index values speculatively
  *		index_markpos	- mark a scan position
  *		index_restrpos	- restore a scan position
+ *		index_proceed	- proceed with insert?
+ *		index_release	- release index locks
+ *		index_tid		- get duplicate tid from speculative state
  *		index_getnext_tid	- get the next TID from a scan
  *		index_fetch_heap		- get the scan's next heap tuple
  *		index_getnext	- get the next heap tuple from a scan
@@ -93,6 +97,13 @@
 	AssertMacro(RelationIsValid(indexRelation)), \
 	AssertMacro(PointerIsValid(indexRelation->rd_am)), \
 	AssertMacro(!ReindexIsProcessingIndex(RelationGetRelid(indexRelation))) \
+)
+
+#define SPECULATIVE_CHECKS \
+( \
+	AssertMacro(!state || \
+				RelationGetRelid(indexRelation) ==    \
+				RelationGetRelid(state->uniqueIndex)) \
 )
 
 #define SCAN_CHECKS \
@@ -205,14 +216,18 @@ index_insert(Relation indexRelation,
 			 bool *isnull,
 			 ItemPointer heap_t_ctid,
 			 Relation heapRelation,
-			 IndexUniqueCheck checkUnique)
+			 IndexUniqueCheck checkUnique,
+			 SpeculativeState *state)
 {
 	FmgrInfo   *procedure;
+	bool		satisfies;
 
 	RELATION_CHECKS;
+	SPECULATIVE_CHECKS;
 	GET_REL_PROCEDURE(aminsert);
 
-	if (!(indexRelation->rd_am->ampredlocks))
+	/* First phase may do SSI check instead */
+	if (!(indexRelation->rd_am->ampredlocks) && !state)
 		CheckForSerializableConflictIn(indexRelation,
 									   (HeapTuple) NULL,
 									   InvalidBuffer);
@@ -220,13 +235,143 @@ index_insert(Relation indexRelation,
 	/*
 	 * have the am's insert proc do all the work.
 	 */
-	return DatumGetBool(FunctionCall6(procedure,
+	satisfies = DatumGetBool(FunctionCall7(procedure,
 									  PointerGetDatum(indexRelation),
 									  PointerGetDatum(values),
 									  PointerGetDatum(isnull),
 									  PointerGetDatum(heap_t_ctid),
 									  PointerGetDatum(heapRelation),
-									  Int32GetDatum((int32) checkUnique)));
+									  Int32GetDatum((int32) checkUnique),
+									  PointerGetDatum(state)));
+
+	/*
+	 * AM will have released private speculative insertion state and locks, but
+	 * the responsibility to release generic state rests here
+	 */
+	if (state)
+		pfree(state);
+
+	return satisfies;
+}
+
+/* ----------------
+ * index_lock - lock index values speculatively.
+ *
+ * Returns palloc'd state indicating if the insertion would have proceeded were
+ * this not just a "dry-run".  The underlying amcanunique implementation
+ * performs locking.  Callers are obligated to pass this state back in a
+ * subsequent index_insert, or use the callback set here to release locks and
+ * other resources.
+ * ----------------
+ */
+SpeculativeState *
+index_lock(Relation indexRelation,
+		   Datum *values,
+		   bool *isnull,
+		   Relation heapRelation,
+		   List *otherSpecStates,
+		   bool priorConflict)
+{
+	FmgrInfo   *procedure;
+
+	RELATION_CHECKS;
+	GET_REL_PROCEDURE(amlock);
+
+	/* This operation is only meaningful for unique indexes */
+	Assert(indexRelation->rd_am->amcanunique);
+
+	/*
+	 * call am's lock proc.
+	 */
+	return (SpeculativeState *) DatumGetPointer(FunctionCall6(procedure,
+												PointerGetDatum(indexRelation),
+												PointerGetDatum(values),
+												PointerGetDatum(isnull),
+												PointerGetDatum(heapRelation),
+												PointerGetDatum(otherSpecStates),
+												BoolGetDatum(priorConflict)));
+}
+
+/* ----------------
+ * index_proceed - should we proceed with a speculative insertion?
+ *
+ * Returns whether or not to proceed (states may be NIL).  A would-be duplicate
+ * key violation on any unique index is grounds for not proceeding with the
+ * second phase of speculative insertion (as is there never being a request for
+ * speculative insertion).  Total consensus is required.
+ * ----------------
+ */
+bool
+index_proceed(List *specStates)
+{
+	ListCell   *lc;
+
+	foreach(lc, specStates)
+	{
+		SpeculativeState   *state = lfirst(lc);
+		SpecStatus			outcome = state->outcome;
+
+		Assert(outcome != INSERT_TRY_AGAIN);
+
+		if (outcome == INSERT_NO_PROCEED)
+			return false;
+	}
+
+	return true;
+}
+
+/* ----------------
+ * index_release - release resources from speculative insertion.
+ *
+ * Unique index value locks and other resources are freed here.  This is called
+ * just prior to the latter phase of speculative insertion, in respect of a
+ * single slot.
+ *
+ * The AM must free its own private resources here (principally, value locks).
+ * We release the AM-generic state itself.
+ *
+ * It's possible that the AM will call this function itself directly, passing
+ * back the list of other states that that particular invocation is itself
+ * passed.  This can occur due to needing to release all value locks prior to
+ * waiting.
+ *
+ * Returns a heap item pointer for locking where applicable.
+ * ----------------
+ */
+ItemPointer
+index_release(List *specStates)
+{
+	ListCell	   *lc;
+	ItemPointer		conflict = NULL;
+
+	/*
+	 * Note that unlocking occurs in the same order as insertion would have,
+	 * and so is in the opposite order to the original lock acquisition (i.e.
+	 * it is "right-way-around")
+	 */
+	foreach(lc, specStates)
+	{
+		SpeculativeState *state = lfirst(lc);
+
+		/* Only expecting one tuple to lock */
+		Assert(!conflict || state->outcome != INSERT_NO_PROCEED);
+		if (state->outcome == INSERT_NO_PROCEED)
+		{
+			Assert(ItemPointerIsValid(state->conflictTid));
+			conflict = state->conflictTid;
+		}
+
+		/*
+		 * Only release value locks (and other resources) for unique indexes
+		 * that have indicated they require it
+		 */
+		if (state->callback)
+			(*state->callback) (state);
+
+		pfree(state);
+	}
+
+	return conflict;
 }
 
 /*

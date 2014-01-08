@@ -550,6 +550,55 @@ MultiXactIdIsRunning(MultiXactId multi)
 }
 
 /*
+ * MultiXactIdAmMember
+ *		Returns whether a MultiXactId has myself as a member.
+ *
+ * We return true if at least one member of the given MultiXactId is any live
+ * subtransaction of the current top-level transaction.  Note that a "false"
+ * result is certain not to change, because it is not legal to add members to
+ * an existing MultiXactId.
+ *
+ * Caller is expected to have verified that the multixact does not come from a
+ * pg_upgraded share-locked tuple.
+ */
+bool
+MultiXactIdAmMember(MultiXactId multi)
+{
+	MultiXactMember *members;
+	int			nmembers;
+	int			i;
+
+	debug_elog3(DEBUG2, "IsMember %u?", multi);
+
+	/*
+	 * "false" here means we assume our callers have checked that the given
+	 * multi cannot possibly come from a pg_upgraded database.
+	 */
+	nmembers = GetMultiXactIdMembers(multi, &members, false);
+
+	if (nmembers < 0)
+	{
+		debug_elog2(DEBUG2, "IsMember: no members");
+		return false;
+	}
+
+	/*
+	 * Only checking for myself is requested; return true if any live
+	 * subtransaction of the current top-level transaction is a member.
+	 */
+	for (i = 0; i < nmembers; i++)
+	{
+		if (TransactionIdIsCurrentTransactionId(members[i].xid))
+		{
+			debug_elog3(DEBUG2, "IsMember: I (%d) am a member!", i);
+			pfree(members);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * MultiXactIdSetOldestMember
  *		Save the oldest MultiXactId this transaction could be a member of.
  *

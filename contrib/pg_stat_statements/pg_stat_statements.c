@@ -1461,6 +1461,7 @@ JumbleQuery(pgssJumbleState *jstate, Query *query)
 	JumbleRangeTable(jstate, query->rtable);
 	JumbleExpr(jstate, (Node *) query->jointree);
 	JumbleExpr(jstate, (Node *) query->targetList);
+	APP_JUMB(query->specClause);
 	JumbleExpr(jstate, (Node *) query->returningList);
 	JumbleExpr(jstate, (Node *) query->groupClause);
 	JumbleExpr(jstate, query->havingQual);

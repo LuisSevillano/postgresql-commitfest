@@ -94,8 +94,8 @@ my %replace_line = (
 	  'SHOW TRANSACTION ISOLATION LEVEL ecpg_into',
 	'VariableShowStmtSHOWSESSIONAUTHORIZATION' =>
 	  'SHOW SESSION AUTHORIZATION ecpg_into',
-	'returning_clauseRETURNINGtarget_list' =>
-	  'RETURNING target_list ecpg_into',
+	'opt_returning_clauseRETURNINGopt_rejectstarget_list' =>
+	  'RETURNING opt_rejects target_list ecpg_into',
 	'ExecuteStmtEXECUTEnameexecute_param_clause' =>
 	  'EXECUTE prepared_name execute_param_clause execute_rest',
 'ExecuteStmtCREATEOptTempTABLEcreate_as_targetASEXECUTEnameexecute_param_clause'

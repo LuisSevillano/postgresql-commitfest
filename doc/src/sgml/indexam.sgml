@@ -176,13 +176,78 @@ ambuildempty (Relation indexRelation);
 
   <para>
 <programlisting>
+SpeculativeState *state
+amlock (Relation  uniqueIndexRelation,
+        Datum     values,
+        bool     *isnull,
+        Relation  heapRel,
+        List     *otherSpecStates,
+        bool      priorConflict
+);
+</programlisting>
+   Lock index tuple values as part of the first phase of speculative
+   insertion.  If all unique index values are concurrently locked, the
+   core system will attempt a proper insertion.  Otherwise, it may
+   lock a <quote>rejector row</> TID returned through the state return
+   value.
+  </para>
+<!--
+N.B.: The fact that we TOAST with value locks held (as described
+below) can be revisited, and is obviously possible to avoid by doing
+heap_prepare_insert, before or after value locking path.
++-->
+  <para>
+   The core system will not hold on to value locks acquired by AMs for
+   more than an instant.  It will only hold index value locks across
+   insertion of the corresponding heap row, perhaps including
+   toasting, and across multiple <structfield>amcanunique</> lock
+   acquisitions, plus the latter phase of speculative insertion.  AM
+   authors should carefully analyze the deadlock hazards, including
+   interaction with system catalogs that may be innocously queried
+   with little provocation, and including calls to arbitrary
+   user-defined functions with value locks held during
+   <function>FormIndexDatum</> with expression indexes.
+   Conventionally, value locks are implemented using heavyweight locks
+   on pages, managed by the lock manager.  The core code calls the
+   function in reverse order to the usual insertion order.  The
+   <literal>priorConflict</> field hints to the implementation that
+   there was recently a conflict on the constant proposed for
+   insertion, which can optionally be used to implement opportunistic
+   lock strength reduction optimizations.
+  </para>
+
+  <para>
+   The function's state result value is used in a subsequent call to
+   <function>aminsert</> if and only if the core system resolves to
+   proceed with speculative insertion of a slot proposed for
+   insertion, which it will do if all value locks are successfully
+   acquired (though even that condition does not ensure that the
+   system will not need to restart from the very beginning of value
+   locking for all unique indexes -- <structfield>amcanunique</>
+   methods can only assume that insertion will proceed when there is a
+   corresponding <function>aminsert</> call, and can probably never
+   reasonably ascertain that insertion will not proceed, since that's
+   the core code's concern.  The core code will only release index
+   value locks through callback, however).  It also provides callbacks
+   for both the core code and all <structfield>amcanunique</> access
+   methods to release all value locks. The routine may need to do so
+   for all value locks held while it blocks pending the outcome of a
+   conflicting transaction.  The AM may then report an unsuccessful
+   attempt at value locking, obliging the core code to restart all
+   value locking for all unique indexes. see <xref
+   linkend="index-unique-checks"> for more details.
+  </para>
+
+  <para>
+<programlisting>
 bool
 aminsert (Relation indexRelation,
           Datum *values,
           bool *isnull,
           ItemPointer heap_tid,
           Relation heapRelation,
-          IndexUniqueCheck checkUnique);
+          IndexUniqueCheck checkUnique,
+          SpeculativeState *state);
 </programlisting>
    Insert a new tuple into an existing index.  The <literal>values</> and
    <literal>isnull</> arrays give the key values to be indexed, and
@@ -190,11 +255,15 @@ aminsert (Relation indexRelation,
    If the access method supports unique indexes (its
    <structname>pg_am</>.<structfield>amcanunique</> flag is true) then
    <literal>checkUnique</> indicates the type of uniqueness check to
-   perform.  This varies depending on whether the unique constraint is
-   deferrable; see <xref linkend="index-unique-checks"> for details.
-   Normally the access method only needs the <literal>heapRelation</>
-   parameter when performing uniqueness checking (since then it will have to
-   look into the heap to verify tuple liveness).
+   perform, and <literal>state</> indicates state that is passed
+   backwards and forwards between the AM and core code to manage
+   speculative insertion state, and to provide a callback to release
+   all value locks held.  <literal>checkUnique</> varies depending on
+   whether the unique constraint is deferrable; see <xref
+   linkend="index-unique-checks"> for details.  Normally the access
+   method only needs the <literal>heapRelation</> parameter when
+   performing uniqueness checking (since then it will have to look
+   into the heap to verify tuple liveness).
   </para>
 
   <para>
@@ -766,7 +835,15 @@ amrestrpos (IndexScanDesc scan);
    using <firstterm>unique indexes</>, which are indexes that disallow
    multiple entries with identical keys.  An access method that supports this
    feature sets <structname>pg_am</>.<structfield>amcanunique</> true.
-   (At present, only b-tree supports it.)
+   (At present, only b-tree supports it.)  Note that
+   <structfield>amcanunique</> access methods are also obliged to
+   support <quote>speculative insertion</> via phased locking in
+   advance of heap tuple insertion, where <quote>value locks</>
+   matching values proposed for insertion are held across multiple
+   <structfield>amcanunique</> indexes concurrently.  This feature is
+   used by <command>INSERT</command> statements when <literal>ON
+   DUPLICATE KEY LOCK FOR UPDATE</literal> or <literal>ON DUPLICATE
+   KEY IGNORE</literal> is specified.
   </para>
 
   <para>
@@ -792,15 +869,27 @@ amrestrpos (IndexScanDesc scan);
        transaction, the would-be inserter must wait to see if that transaction
        commits.  If it rolls back then there is no conflict.  If it commits
        without deleting the conflicting row again, there is a uniqueness
-       violation.  (In practice we just wait for the other transaction to
-       end and then redo the visibility check in toto.)
+       violation.  (In practice we just wait for the other transaction
+       to end and then redo the visibility check in toto).  However,
+       during speculative insertion, where a unique constraint
+       violation cannot be thrown, but it is unlikely to be practicle
+       to hold on to a value lock indefinitely pending the outcome of
+       another transaction, a callback is provided to instruct the
+       core code to release all value locks.  When a wait on the
+       conflicting transaction is complete, the AM specifies that the
+       core code should retry its slot insertion from scratch,
+       possibly reacquiring value locks on previously locked values on
+       seperate, earlier-locked unique indexes.
       </para>
      </listitem>
      <listitem>
       <para>
        Similarly, if a conflicting valid row has been deleted by an
        as-yet-uncommitted transaction, the would-be inserter must wait
-       for that transaction to commit or abort, and then repeat the test.
+       for that transaction to commit or abort, and then repeat the
+       test, or in the case of speculative insertion, start value
+       locking for all values proposed for insertion by the current
+       executor slot from scratch.
       </para>
      </listitem>
     </itemizedlist>
@@ -813,7 +902,8 @@ amrestrpos (IndexScanDesc scan);
    no violation should be reported.  (This case cannot occur during the
    ordinary scenario of inserting a row that's just been created by
    the current transaction.  It can happen during
-   <command>CREATE UNIQUE INDEX CONCURRENTLY</>, however.)
+   <command>CREATE UNIQUE INDEX CONCURRENTLY</>, however).
+   Speculative inserters need not bother with this.
   </para>
 
   <para>
@@ -831,17 +921,20 @@ amrestrpos (IndexScanDesc scan);
   <para>
    If the unique constraint is deferrable, there is additional complexity:
    we need to be able to insert an index entry for a new row, but defer any
-   uniqueness-violation error until end of statement or even later.  To
-   avoid unnecessary repeat searches of the index, the index access method
-   should do a preliminary uniqueness check during the initial insertion.
-   If this shows that there is definitely no conflicting live tuple, we
-   are done.  Otherwise, we schedule a recheck to occur when it is time to
-   enforce the constraint.  If, at the time of the recheck, both the inserted
-   tuple and some other tuple with the same key are live, then the error
-   must be reported.  (Note that for this purpose, <quote>live</> actually
-   means <quote>any tuple in the index entry's HOT chain is live</>.)
-   To implement this, the <function>aminsert</> function is passed a
-   <literal>checkUnique</> parameter having one of the following values:
+   uniqueness-violation error until end of statement or even later.
+   Speculative insertion into deferred unique indexes is not
+   supported.  To avoid unnecessary repeat searches of the index, the
+   index access method should do a preliminary uniqueness check during
+   the initial insertion.  If this shows that there is definitely no
+   conflicting live tuple, we are done.  Otherwise, we schedule a
+   recheck to occur when it is time to enforce the constraint.  If, at
+   the time of the recheck, both the inserted tuple and some other
+   tuple with the same key are live, then the error must be reported.
+   (Note that for this purpose, <quote>live</> actually means
+   <quote>any tuple in the index entry's HOT chain is live</>.) To
+   implement this, the <function>aminsert</> function is passed a
+   <literal>checkUnique</> parameter having one of the following
+   values:
 
     <itemizedlist>
      <listitem>
@@ -898,6 +991,33 @@ amrestrpos (IndexScanDesc scan);
        might be checking the wrong area of the index.  Checking that the
        target row is found in the recheck verifies that we are scanning
        for the same tuple values as were used in the original insertion.
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       <literal>UNIQUE_CHECK_SPEC</> indicates that the call is the
+       second phase of speculative insertion, corresponding to an
+       earlier <function>amlock</> call.  Value locks should already
+       be held from the first phae for unique index insertion to pick
+       up from, with a heap tuple pointer now past to finish the
+       insertion with.  The core code will have previously called
+       <function>amlock</> in respect of each index value as part of
+       this slot insertion.  Conceptually, the implementation performs
+       the index tuple insertion in a staggered manner, with the work
+       broken out into discrete locking and insertion phases, with the
+       possibility of not continuing with insertion (to lock a row for
+       update, for example) in the event of total consensus to proceed
+       among unique indexes not emerging.
+      </para>
+
+      <para>
+       Precautions must be taken around value locking.  These are
+       separately noted in the <function>amlock</> documentation.  If
+       insertion proceeds in respect of a given slot, and
+       <function>aminsert</> is called with a
+       <literal>UNIQUE_CHECK_SPEC</> argument, the
+       <function>aminsert</> implementation is obligated to release
+       its value lock on the unique index as part of insertion.
       </para>
      </listitem>
     </itemizedlist>

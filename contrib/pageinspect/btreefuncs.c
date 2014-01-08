@@ -118,7 +118,12 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 	else if (P_IGNORE(opaque))
 		stat->type = 'e';
 	else if (P_ISLEAF(opaque))
-		stat->type = 'l';
+	{
+		if (P_HAS_LOCK(opaque))
+			stat->type = 'L';
+		else
+			stat->type = 'l';
+	}
 	else if (P_ISROOT(opaque))
 		stat->type = 'r';
 	else

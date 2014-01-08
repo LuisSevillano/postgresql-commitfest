@@ -4105,8 +4105,12 @@ l3:
 
 	if (result == HeapTupleInvisible)
 	{
-		UnlockReleaseBuffer(*buffer);
-		elog(ERROR, "attempted to lock invisible tuple");
+		LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+		/*
+		 * This is expected iff we're locking a tuple as part of
+		 * speculative insertion
+		 */
+		return HeapTupleInvisible;
 	}
 	else if (result == HeapTupleBeingUpdated)
 	{

@@ -235,10 +235,59 @@ btbuildempty(PG_FUNCTION_ARGS)
 }
 
 /*
+ *	btlock() -- First phase of speculative index tuple insertion.
+ *
+ *		Descend the tree recursively, find the appropriate location for our new
+ *		tuple, or an existing tuple with the same value as the value argument
+ *		passed.  Lock the value for an instant (the implementation performs
+ *		locking at a granularity coarser than strictly necessary), preventing
+ *		concurrent insertion of would-be duplicates, and let the caller know if
+ *		insertion can proceed.  Value locks may still be held, and exact
+ *		details of who frees them and other state, and when, is arbitrated by
+ *		implementation (sometimes it pro-actively releases its own locks) and
+ *		is fully described within _bt_lockinsert().
+ */
+Datum
+btlock(PG_FUNCTION_ARGS)
+{
+	Relation			rel = (Relation) PG_GETARG_POINTER(0);
+	Datum			   *values = (Datum *) PG_GETARG_POINTER(1);
+	bool			   *isnull = (bool *) PG_GETARG_POINTER(2);
+	Relation			heapRel = (Relation) PG_GETARG_POINTER(3);
+	List			   *otherSpecStates = (List *) PG_GETARG_POINTER(4);
+	bool				priorConflict = PG_GETARG_BOOL(5);
+	SpeculativeState   *specState = palloc(sizeof(SpeculativeState));
+	BTSpecOpaque		btspec = palloc(sizeof(BTSpecOpaqueData));
+
+	/* allocate conflict tid space */
+	specState->conflictTid = palloc0(sizeof(ItemPointerData));
+	/* generate an index tuple */
+	btspec->itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
+	/* set private state, set by _bt_lockinsert, for return to caller */
+	specState->privState = btspec;
+
+	_bt_lockinsert(rel, heapRel, specState, otherSpecStates, priorConflict);
+
+	/* done, free private state allocated here, since we cannot get callback */
+	if (specState->outcome != INSERT_PROCEED)
+	{
+		pfree(btspec->itup);
+		pfree(btspec);
+	}
+
+	PG_RETURN_POINTER(specState);
+}
+
+/*
  *	btinsert() -- insert an index tuple into a btree.
  *
- *		Descend the tree recursively, find the appropriate location for our
- *		new tuple, and put it there.
+ *		Descend the tree recursively, find the appropriate location for our new
+ *		tuple (though in the speculative insertion case, btlock will have taken
+ *		care of much of that for us already), and put it there.  This can be
+ *		called for a conventional insertion, or the latter phase of speculative
+ *		insertion (it is called in the same manner as always for non-unique
+ *		indexes during what the executor would formally consider to be the
+ *		second phase of speculative insertion).
  */
 Datum
 btinsert(PG_FUNCTION_ARGS)
@@ -249,16 +298,33 @@ btinsert(PG_FUNCTION_ARGS)
 	ItemPointer ht_ctid = (ItemPointer) PG_GETARG_POINTER(3);
 	Relation	heapRel = (Relation) PG_GETARG_POINTER(4);
 	IndexUniqueCheck checkUnique = (IndexUniqueCheck) PG_GETARG_INT32(5);
+	SpeculativeState *specState = (SpeculativeState *) PG_GETARG_POINTER(6);
+	BTSpecOpaque btspec;
 	bool		result;
-	IndexTuple	itup;
+	IndexTuple	itup = NULL;
 
-	/* generate an index tuple */
-	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
+	if (!specState)
+	{
+		/* non-speculative insertion, generate an index tuple from scratch */
+		itup = index_form_tuple(RelationGetDescr(rel), values, isnull);
+	}
+	else
+	{
+		btspec = (BTSpecOpaque) specState->privState;
+		/* Used cached index tuple from first phase (value locking) */
+		itup = btspec->itup;
+	}
 	itup->t_tid = *ht_ctid;
 
-	result = _bt_doinsert(rel, itup, checkUnique, heapRel);
+	Assert(ItemPointerIsValid(&itup->t_tid));
+
+	result = _bt_doinsert(rel, itup, checkUnique, heapRel, specState);
 
 	pfree(itup);
+
+	/* free private state only - caller should always free specState */
+	if (specState)
+		pfree(specState->privState);
 
 	PG_RETURN_BOOL(result);
 }

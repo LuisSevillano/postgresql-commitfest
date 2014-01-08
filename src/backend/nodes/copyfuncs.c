@@ -182,6 +182,7 @@ _copyModifyTable(const ModifyTable *from)
 	COPY_NODE_FIELD(returningLists);
 	COPY_NODE_FIELD(fdwPrivLists);
 	COPY_NODE_FIELD(rowMarks);
+	COPY_SCALAR_FIELD(spec);
 	COPY_SCALAR_FIELD(epqParam);
 
 	return newnode;
@@ -2087,6 +2088,18 @@ _copyWithClause(const WithClause *from)
 	return newnode;
 }
 
+static ReturningClause *
+_copyReturningClause(const ReturningClause *from)
+{
+	ReturningClause *newnode = makeNode(ReturningClause);
+
+	COPY_NODE_FIELD(returningList);
+	COPY_SCALAR_FIELD(rejects);
+	COPY_LOCATION_FIELD(location);
+
+	return newnode;
+}
+
 static CommonTableExpr *
 _copyCommonTableExpr(const CommonTableExpr *from)
 {
@@ -2478,6 +2491,7 @@ _copyQuery(const Query *from)
 	COPY_NODE_FIELD(jointree);
 	COPY_NODE_FIELD(targetList);
 	COPY_NODE_FIELD(withCheckOptions);
+	COPY_SCALAR_FIELD(specClause);
 	COPY_NODE_FIELD(returningList);
 	COPY_NODE_FIELD(groupClause);
 	COPY_NODE_FIELD(havingQual);
@@ -2501,7 +2515,8 @@ _copyInsertStmt(const InsertStmt *from)
 	COPY_NODE_FIELD(relation);
 	COPY_NODE_FIELD(cols);
 	COPY_NODE_FIELD(selectStmt);
-	COPY_NODE_FIELD(returningList);
+	COPY_SCALAR_FIELD(specClause);
+	COPY_NODE_FIELD(rlist);
 	COPY_NODE_FIELD(withClause);
 
 	return newnode;
@@ -2515,7 +2530,7 @@ _copyDeleteStmt(const DeleteStmt *from)
 	COPY_NODE_FIELD(relation);
 	COPY_NODE_FIELD(usingClause);
 	COPY_NODE_FIELD(whereClause);
-	COPY_NODE_FIELD(returningList);
+	COPY_NODE_FIELD(rlist);
 	COPY_NODE_FIELD(withClause);
 
 	return newnode;
@@ -2530,7 +2545,7 @@ _copyUpdateStmt(const UpdateStmt *from)
 	COPY_NODE_FIELD(targetList);
 	COPY_NODE_FIELD(whereClause);
 	COPY_NODE_FIELD(fromClause);
-	COPY_NODE_FIELD(returningList);
+	COPY_NODE_FIELD(rlist);
 	COPY_NODE_FIELD(withClause);
 
 	return newnode;
@@ -4594,6 +4609,9 @@ copyObject(const void *from)
 			break;
 		case T_WithClause:
 			retval = _copyWithClause(from);
+			break;
+		case T_ReturningClause:
+			retval = _copyReturningClause(from);
 			break;
 		case T_CommonTableExpr:
 			retval = _copyCommonTableExpr(from);

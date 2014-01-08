@@ -861,6 +861,7 @@ _equalQuery(const Query *a, const Query *b)
 	COMPARE_NODE_FIELD(jointree);
 	COMPARE_NODE_FIELD(targetList);
 	COMPARE_NODE_FIELD(withCheckOptions);
+	COMPARE_SCALAR_FIELD(specClause);
 	COMPARE_NODE_FIELD(returningList);
 	COMPARE_NODE_FIELD(groupClause);
 	COMPARE_NODE_FIELD(havingQual);
@@ -882,7 +883,8 @@ _equalInsertStmt(const InsertStmt *a, const InsertStmt *b)
 	COMPARE_NODE_FIELD(relation);
 	COMPARE_NODE_FIELD(cols);
 	COMPARE_NODE_FIELD(selectStmt);
-	COMPARE_NODE_FIELD(returningList);
+	COMPARE_SCALAR_FIELD(specClause);
+	COMPARE_NODE_FIELD(rlist);
 	COMPARE_NODE_FIELD(withClause);
 
 	return true;
@@ -894,7 +896,7 @@ _equalDeleteStmt(const DeleteStmt *a, const DeleteStmt *b)
 	COMPARE_NODE_FIELD(relation);
 	COMPARE_NODE_FIELD(usingClause);
 	COMPARE_NODE_FIELD(whereClause);
-	COMPARE_NODE_FIELD(returningList);
+	COMPARE_NODE_FIELD(rlist);
 	COMPARE_NODE_FIELD(withClause);
 
 	return true;
@@ -907,7 +909,7 @@ _equalUpdateStmt(const UpdateStmt *a, const UpdateStmt *b)
 	COMPARE_NODE_FIELD(targetList);
 	COMPARE_NODE_FIELD(whereClause);
 	COMPARE_NODE_FIELD(fromClause);
-	COMPARE_NODE_FIELD(returningList);
+	COMPARE_NODE_FIELD(rlist);
 	COMPARE_NODE_FIELD(withClause);
 
 	return true;
@@ -2356,6 +2358,16 @@ _equalWithClause(const WithClause *a, const WithClause *b)
 }
 
 static bool
+_equalReturningClause(const ReturningClause *a, const ReturningClause *b)
+{
+	COMPARE_NODE_FIELD(returningList);
+	COMPARE_SCALAR_FIELD(rejects);
+	COMPARE_LOCATION_FIELD(location);
+
+	return true;
+}
+
+static bool
 _equalCommonTableExpr(const CommonTableExpr *a, const CommonTableExpr *b)
 {
 	COMPARE_STRING_FIELD(ctename);
@@ -3063,6 +3075,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_WithClause:
 			retval = _equalWithClause(a, b);
+			break;
+		case T_ReturningClause:
+			retval = _equalReturningClause(a, b);
 			break;
 		case T_CommonTableExpr:
 			retval = _equalCommonTableExpr(a, b);

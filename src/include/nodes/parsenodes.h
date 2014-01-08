@@ -130,6 +130,8 @@ typedef struct Query
 
 	List	   *withCheckOptions; /* a list of WithCheckOption's */
 
+	SpecType	specClause;		/* speculative insertion clause */
+
 	List	   *returningList;	/* return-values list (of TargetEntry) */
 
 	List	   *groupClause;	/* a list of SortGroupClause's */
@@ -980,6 +982,21 @@ typedef struct WithClause
 } WithClause;
 
 /*
+ * ReturningClause -
+ * 		representation of returninglist for parsing
+ *
+ * Note: ReturningClause does not propogate into the Query representation;
+ * returningList does, while rejects influences speculative insertion.
+ */
+typedef struct ReturningClause
+{
+	NodeTag		type;
+	List	   *returningList;	/* List proper */
+	bool		rejects;		/* A list of rejects? */
+	int			location;		/* token location, or -1 if unknown */
+} ReturningClause;
+
+/*
  * CommonTableExpr -
  *	   representation of WITH list element
  *
@@ -1029,7 +1046,8 @@ typedef struct InsertStmt
 	RangeVar   *relation;		/* relation to insert into */
 	List	   *cols;			/* optional: names of the target columns */
 	Node	   *selectStmt;		/* the source SELECT/VALUES, or NULL */
-	List	   *returningList;	/* list of expressions to return */
+	SpecType	specClause;		/* ON DUPLICATE KEY specification */
+	ReturningClause *rlist;		/* expressions to return */
 	WithClause *withClause;		/* WITH clause */
 } InsertStmt;
 
@@ -1043,7 +1061,7 @@ typedef struct DeleteStmt
 	RangeVar   *relation;		/* relation to delete from */
 	List	   *usingClause;	/* optional using clause for more tables */
 	Node	   *whereClause;	/* qualifications */
-	List	   *returningList;	/* list of expressions to return */
+	ReturningClause *rlist;		/* expressions to return */
 	WithClause *withClause;		/* WITH clause */
 } DeleteStmt;
 
@@ -1058,7 +1076,7 @@ typedef struct UpdateStmt
 	List	   *targetList;		/* the target list (of ResTarget) */
 	Node	   *whereClause;	/* qualifications */
 	List	   *fromClause;		/* optional from clause for more tables */
-	List	   *returningList;	/* list of expressions to return */
+	ReturningClause *rlist;		/* expressions to return */
 	WithClause *withClause;		/* WITH clause */
 } UpdateStmt;
 

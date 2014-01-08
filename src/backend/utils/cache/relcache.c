@@ -108,6 +108,18 @@ typedef struct relidcacheent
 	Relation	reldesc;
 } RelIdCacheEnt;
 
+/*
+ *		Representation of indexes for sorting purposes
+ *
+ *		We use this to sort indexes globally by a specific sort order, per
+ *		RelationGetIndexList().
+ */
+typedef struct relidunq
+{
+	int			relprimunique;
+	Oid			relindexid;
+} relidunq;
+
 static HTAB *RelationIdCache;
 
 /*
@@ -246,7 +258,7 @@ static TupleDesc GetPgClassDescriptor(void);
 static TupleDesc GetPgIndexDescriptor(void);
 static void AttrDefaultFetch(Relation relation);
 static void CheckConstraintFetch(Relation relation);
-static List *insert_ordered_oid(List *list, Oid datum);
+static int relidunq_cmp(const void *a, const void *b);
 static void IndexSupportInitialize(oidvector *indclass,
 					   RegProcedure *indexSupport,
 					   Oid *opFamily,
@@ -3445,11 +3457,19 @@ CheckConstraintFetch(Relation relation)
  * Such indexes are expected to be dropped momentarily, and should not be
  * touched at all by any caller of this function.
  *
- * The returned list is guaranteed to be sorted in order by OID.  This is
- * needed by the executor, since for index types that we obtain exclusive
- * locks on when updating the index, all backends must lock the indexes in
- * the same order or we will get deadlocks (see ExecOpenIndices()).  Any
- * consistent ordering would do, but ordering by OID is easy.
+ * The returned list is guaranteed to be sorted ordered by (!indisprimary,
+ * !indisunique, OID) ascending.  This is needed by the executor, since for
+ * index types that we obtain exclusive locks on when updating the index, all
+ * backends must lock the indexes in the same order or we will get deadlocks
+ * (see ExecOpenIndices()).  For most purposes any consistent ordering would
+ * do, but there are a couple of further considerations, which is why we put
+ * unique indexes first:  during speculative insertion, the executor prefers to
+ * minimize its value locking window, so insertion of unique index tuples
+ * always occurs first (with primary key index tuples always inserted into
+ * before any other unique index, and always locked last).  Furthermore, it is
+ * generally useful to get insertion into unique indexes out of the way, since
+ * unique violations are the cause of many aborted transactions, making it
+ * useful to always avoid bloating non-unique indexes of the same slot.
  *
  * Since shared cache inval causes the relcache's copy of the list to go away,
  * we return a copy of the list palloc'd in the caller's context.  The caller
@@ -3469,7 +3489,11 @@ RelationGetIndexList(Relation relation)
 	SysScanDesc indscan;
 	ScanKeyData skey;
 	HeapTuple	htup;
-	List	   *result;
+	relidunq   *indexTypes;
+	int			nIndexType;
+	int			i;
+	Size		szIndexTypes;
+	List	   *result = NIL;
 	char		replident = relation->rd_rel->relreplident;
 	Oid			oidIndex = InvalidOid;
 	Oid			pkeyIndex = InvalidOid;
@@ -3486,7 +3510,6 @@ RelationGetIndexList(Relation relation)
 	 * list into the relcache entry.  This avoids cache-context memory leakage
 	 * if we get some sort of error partway through.
 	 */
-	result = NIL;
 	oidIndex = InvalidOid;
 
 	/* Prepare to scan pg_index for entries having indrelid = this rel. */
@@ -3499,11 +3522,15 @@ RelationGetIndexList(Relation relation)
 	indscan = systable_beginscan(indrel, IndexIndrelidIndexId, true,
 								 NULL, 1, &skey);
 
+	nIndexType = 0;
+	szIndexTypes = 5;
+	indexTypes = palloc(sizeof(relidunq) * szIndexTypes);
 	while (HeapTupleIsValid(htup = systable_getnext(indscan)))
 	{
 		Form_pg_index index = (Form_pg_index) GETSTRUCT(htup);
 		Datum		indclassDatum;
 		oidvector  *indclass;
+		relidunq	indexType;
 		bool		isnull;
 
 		/*
@@ -3515,8 +3542,22 @@ RelationGetIndexList(Relation relation)
 		if (!IndexIsLive(index))
 			continue;
 
-		/* Add index's OID to result list in the proper order */
-		result = insert_ordered_oid(result, index->indexrelid);
+		if (index->indisprimary)
+			indexType.relprimunique = 0;
+		else if (index->indisunique)
+			indexType.relprimunique = 1;
+		else
+			indexType.relprimunique = 2;
+
+		indexType.relindexid = index->indexrelid;
+
+		/* Append to array of index oids */
+		if (nIndexType >= szIndexTypes)
+		{
+			szIndexTypes = Max(nIndexType + 1, szIndexTypes * 2);
+			indexTypes = repalloc(indexTypes, sizeof(relidunq) * szIndexTypes);
+		}
+		indexTypes[nIndexType++] = indexType;
 
 		/*
 		 * indclass cannot be referenced directly through the C struct,
@@ -3571,6 +3612,15 @@ RelationGetIndexList(Relation relation)
 
 	heap_close(indrel, AccessShareLock);
 
+	/* sort returned values consistently */
+	qsort(indexTypes, nIndexType, sizeof(relidunq), relidunq_cmp);
+	/* caller expects simple list of Oids */
+	for (i = 0; i < nIndexType; i++)
+		result = lappend_oid(result, indexTypes[i].relindexid);
+
+	/* free temp memory */
+	pfree(indexTypes);
+
 	/* Now save a copy of the completed list in the relcache entry. */
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 	relation->rd_indexlist = list_copy(result);
@@ -3582,36 +3632,30 @@ RelationGetIndexList(Relation relation)
 }
 
 /*
- * insert_ordered_oid
- *		Insert a new Oid into a sorted list of Oids, preserving ordering
+ * relidunq_cmp
+ *		Qsort style comparator for index relations from relcache
  *
- * Building the ordered list this way is O(N^2), but with a pretty small
- * constant, so for the number of entries we expect it will probably be
- * faster than trying to apply qsort().  Most tables don't have very many
- * indexes...
+ * The comparator sorts by (indisprimary, indisunique, OID), for reasons
+ * enumerated in RelationGetIndexList.
  */
-static List *
-insert_ordered_oid(List *list, Oid datum)
+static int
+relidunq_cmp(const void *a, const void *b)
 {
-	ListCell   *prev;
+	relidunq		l_idx = (*(relidunq *) a);
+	relidunq		r_idx = (*(relidunq *) b);
 
-	/* Does the datum belong at the front? */
-	if (list == NIL || datum < linitial_oid(list))
-		return lcons_oid(datum, list);
-	/* No, so find the entry it belongs after */
-	prev = list_head(list);
-	for (;;)
-	{
-		ListCell   *curr = lnext(prev);
+	/* Prefer to sort on indisprimary/indisunique */
+	if (l_idx.relprimunique < r_idx.relprimunique)
+		return -1;
+	else if (l_idx.relprimunique > r_idx.relprimunique)
+		return +1;
 
-		if (curr == NULL || datum < lfirst_oid(curr))
-			break;				/* it belongs after 'prev', before 'curr' */
+	if (l_idx.relindexid < r_idx.relindexid)
+		return -1;
+	else if (l_idx.relindexid > r_idx.relindexid)
+		return +1;
 
-		prev = curr;
-	}
-	/* Insert datum into list after 'prev' */
-	lappend_cell_oid(list, prev, datum);
-	return list;
+	return 0;
 }
 
 /*

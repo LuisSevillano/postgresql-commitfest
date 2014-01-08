@@ -24,3 +24,5 @@ test: multixact-no-forget
 test: propagate-lock-delete
 test: drop-index-concurrently-1
 test: timeouts
+test: insert-duplicate-key-ignore
+test: insert-duplicate-key-lock-for-update

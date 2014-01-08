@@ -891,6 +891,7 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot,
  *	Here, we consider the effects of:
  *		all transactions committed as of the time of the given snapshot
  *		previous commands of this transaction
+ *		all rows only locked (not updated) by this transaction, committed by another
  *
  *	Does _not_ include:
  *		transactions shown as in-progress by the snapshot
@@ -1015,7 +1016,39 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot,
 	 */
 	if (!HeapTupleHeaderXminFrozen(tuple)
 		&& XidInMVCCSnapshot(HeapTupleHeaderGetRawXmin(tuple), snapshot))
+	{
+		/*
+		 * Not visible to snapshot under conventional MVCC rules, but may still
+		 * be exclusive locked by our xact and not updated, which satisfies
+		 * MVCC only under a special exception.
+		 */
+		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+		{
+			/*
+			 * This exception is useful to one case, where when tuple locking,
+			 * it's possible to lock a tuple that would be conventionally
+			 * considered still-in-progress.  Such locked tuples should be
+			 * considered visible perhaps entirely by virtue of having been
+			 * locked.  This exception cannot be invoked if the tuple is
+			 * updated, so only one version can be visible at once.  See
+			 * XidInClassicMVCCSnapshot for more information.
+			 */
+			if (!(tuple->t_infomask & HEAP_XMAX_IS_MULTI) &&
+				TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmax(tuple)))
+				return true;
+			/*
+			 * It is not sufficient to assume all xmax values here are not
+			 * MultiXacts, even though in practice only exclusive tuple locks
+			 * are acquired in cases of interest.  The possibility of aborted
+			 * subtransactions necessitates this additionally check.
+			 */
+			if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) &&
+				MultiXactIdAmMember(HeapTupleHeaderGetRawXmax(tuple)))
+				return true;
+		}
+
 		return false;			/* treat as still in progress */
+	}
 
 	if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid or aborted */
 		return true;
@@ -1492,6 +1525,35 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	}
 
 	return false;
+}
+
+/*
+ * XidInTraditionalMVCCSnapshot
+ *		Public variant of XidInMVCCSnapshot.
+ *
+ * This routine indicates if a transaction is still-in-progress to a snapshot
+ * according to a classic notion of MVCC.  Unlike XidInMVCCSnapshot, it
+ * accounts for the current subtransaction, ancestor and child subcommitted
+ * transactions, and so on.
+ *
+ * HeapTupleSatisfiesMVCC has a special MVCC exception to facilitate some cases
+ * where we must lock a tuple whose xmin, if passed to this routine, would
+ * return true (still-in-progress) for the same snapshot.  That exception
+ * undermines the traditional principle that tuples with a certain xmin can
+ * ipso facto be considered definitely invisible to a snapshot.  It's okay for
+ * READ COMMITTED mode to not care about having availed of this special
+ * exception (that's what it's there for), but higher isolation levels must
+ * not, and so should actively call this routine to ensure that that has not
+ * occurred, as a row that may be conventionally still-in-progress is locked.
+ * The special exception is irrelevant to higher isolation levels if the lock
+ * was not acquired by that same transaction, so calling here very selectively
+ * is sufficient.
+ */
+bool
+XidInClassicMVCCSnapshot(TransactionId xid, Snapshot snapshot)
+{
+	return !TransactionIdIsCurrentTransactionId(xid) &&
+				XidInMVCCSnapshot(xid, snapshot);
 }
 
 /*

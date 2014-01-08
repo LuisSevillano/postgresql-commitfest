@@ -1,0 +1,23 @@
+Parsed test spec with 2 sessions
+
+starting permutation: ignore1 ignore2 c1 select2 c2
+step ignore1: INSERT INTO ints(key, val) VALUES(1, 'ignore1') ON DUPLICATE KEY IGNORE;
+step ignore2: INSERT INTO ints(key, val) VALUES(1, 'ignore2') ON DUPLICATE KEY IGNORE; <waiting ...>
+step c1: COMMIT;
+step ignore2: <... completed>
+step select2: SELECT * FROM ints;
+key            val            
+
+1              ignore1        
+step c2: COMMIT;
+
+starting permutation: ignore1 ignore2 a1 select2 c2
+step ignore1: INSERT INTO ints(key, val) VALUES(1, 'ignore1') ON DUPLICATE KEY IGNORE;
+step ignore2: INSERT INTO ints(key, val) VALUES(1, 'ignore2') ON DUPLICATE KEY IGNORE; <waiting ...>
+step a1: ABORT;
+step ignore2: <... completed>
+step select2: SELECT * FROM ints;
+key            val            
+
+1              ignore2        
+step c2: COMMIT;

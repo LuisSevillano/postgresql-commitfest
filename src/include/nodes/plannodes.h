@@ -176,6 +176,7 @@ typedef struct ModifyTable
 	List	   *returningLists; /* per-target-table RETURNING tlists */
 	List	   *fdwPrivLists;	/* per-target-table FDW private data lists */
 	List	   *rowMarks;		/* PlanRowMarks (non-locking only) */
+	SpecType	spec;			/* speculative insertion specification */
 	int			epqParam;		/* ID of Param for EvalPlanQual re-eval */
 } ModifyTable;
 

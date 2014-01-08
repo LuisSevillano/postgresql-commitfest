@@ -211,6 +211,7 @@ _readQuery(void)
 	READ_NODE_FIELD(jointree);
 	READ_NODE_FIELD(targetList);
 	READ_NODE_FIELD(withCheckOptions);
+	READ_ENUM_FIELD(specClause, SpecType);
 	READ_NODE_FIELD(returningList);
 	READ_NODE_FIELD(groupClause);
 	READ_NODE_FIELD(havingQual);

@@ -609,6 +609,7 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 											 withCheckOptionLists,
 											 returningLists,
 											 rowMarks,
+											 parse->specClause,
 											 SS_assign_special_param(root));
 		}
 	}
@@ -1015,6 +1016,7 @@ inheritance_planner(PlannerInfo *root)
 									 withCheckOptionLists,
 									 returningLists,
 									 rowMarks,
+									 parse->specClause,
 									 SS_assign_special_param(root));
 }
 

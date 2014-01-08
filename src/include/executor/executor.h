@@ -348,8 +348,10 @@ extern void ExecCloseScanRelation(Relation scanrel);
 
 extern void ExecOpenIndices(ResultRelInfo *resultRelInfo);
 extern void ExecCloseIndices(ResultRelInfo *resultRelInfo);
+extern List *ExecLockIndexValues(TupleTableSlot *slot, EState *estate,
+						   SpecType specReason, int *conflict);
 extern List *ExecInsertIndexTuples(TupleTableSlot *slot, ItemPointer tupleid,
-					  EState *estate);
+						   EState *estate, List *specStates);
 extern bool check_exclusion_constraint(Relation heap, Relation index,
 						   IndexInfo *indexInfo,
 						   ItemPointer tupleid,

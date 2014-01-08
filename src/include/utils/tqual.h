@@ -85,5 +85,6 @@ extern bool HeapTupleIsSurelyDead(HeapTuple htup,
 extern void HeapTupleSetHintBits(HeapTupleHeader tuple, Buffer buffer,
 					 uint16 infomask, TransactionId xid);
 extern bool HeapTupleHeaderIsOnlyLocked(HeapTupleHeader tuple);
+extern bool XidInClassicMVCCSnapshot(TransactionId xid, Snapshot snapshot);
 
 #endif   /* TQUAL_H */

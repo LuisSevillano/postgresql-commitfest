@@ -52,6 +52,7 @@ typedef LockInfoData *LockInfo;
  */
 typedef struct RelationAmInfo
 {
+	FmgrInfo	amlock;
 	FmgrInfo	aminsert;
 	FmgrInfo	ambeginscan;
 	FmgrInfo	amgettuple;

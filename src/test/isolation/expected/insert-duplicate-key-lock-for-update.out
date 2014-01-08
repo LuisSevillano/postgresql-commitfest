@@ -1,0 +1,23 @@
+Parsed test spec with 2 sessions
+
+starting permutation: lock1 lock2 c1 select2 c2
+step lock1: INSERT INTO ints(key, val) VALUES(1, 'lock1') ON DUPLICATE KEY LOCK FOR UPDATE;
+step lock2: INSERT INTO ints(key, val) VALUES(1, 'lock2') ON DUPLICATE KEY LOCK FOR UPDATE; <waiting ...>
+step c1: COMMIT;
+step lock2: <... completed>
+step select2: SELECT * FROM ints;
+key            val            
+
+1              lock1          
+step c2: COMMIT;
+
+starting permutation: lock1 lock2 a1 select2 c2
+step lock1: INSERT INTO ints(key, val) VALUES(1, 'lock1') ON DUPLICATE KEY LOCK FOR UPDATE;
+step lock2: INSERT INTO ints(key, val) VALUES(1, 'lock2') ON DUPLICATE KEY LOCK FOR UPDATE; <waiting ...>
+step a1: ABORT;
+step lock2: <... completed>
+step select2: SELECT * FROM ints;
+key            val            
+
+1              lock2          
+step c2: COMMIT;

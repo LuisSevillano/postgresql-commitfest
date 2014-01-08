@@ -190,6 +190,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	JoinType			jtype;
 	DropBehavior		dbehavior;
 	OnCommitAction		oncommit;
+	SpecType			spec;
 	List				*list;
 	Node				*node;
 	Value				*value;
@@ -207,6 +208,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	RangeVar			*range;
 	IntoClause			*into;
 	WithClause			*with;
+	ReturningClause		*returnc;
 	A_Indices			*aind;
 	ResTarget			*target;
 	struct PrivTarget	*privtarget;
@@ -345,10 +347,9 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				opclass_purpose opt_opfamily transaction_mode_list_or_empty
 				OptTableFuncElementList TableFuncElementList opt_type_modifiers
 				prep_type_clause
-				execute_param_clause using_clause returning_clause
-				opt_enum_val_list enum_val_list table_func_column_list
-				create_generic_options alter_generic_options
-				relation_expr_list dostmt_opt_list
+				execute_param_clause using_clause opt_enum_val_list
+				enum_val_list table_func_column_list create_generic_options
+				alter_generic_options relation_expr_list dostmt_opt_list
 
 %type <list>	opt_fdw_options fdw_options
 %type <defelt>	fdw_option
@@ -399,6 +400,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	SeqOptElem
 
 %type <istmt>	insert_rest
+%type <spec>	opt_on_duplicate_key
 
 %type <vsetstmt> generic_set set_rest set_rest_more SetResetClause FunctionSetResetClause
 
@@ -492,6 +494,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	func_expr func_expr_windowless
 %type <node>	common_table_expr
 %type <with>	with_clause opt_with_clause
+%type <boolean> opt_rejects
+%type <returnc> opt_returning_clause
 %type <list>	cte_list
 
 %type <list>	within_group_clause
@@ -542,6 +546,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
 	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DESC
 	DICTIONARY DISABLE_P DISCARD DISTINCT DO DOCUMENT_P DOMAIN_P DOUBLE_P DROP
+	DUPLICATE
 
 	EACH ELSE ENABLE_P ENCODING ENCRYPTED END_P ENUM_P ESCAPE EVENT EXCEPT
 	EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN
@@ -554,7 +559,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
-	IDENTITY_P IF_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IN_P
+	IDENTITY_P IF_P IGNORE ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IN_P
 	INCLUDING INCREMENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
@@ -583,7 +588,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	QUOTE
 
 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFRESH REINDEX
-	RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
+	REJECTS RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK
 	ROW ROWS RULE
 
@@ -624,6 +629,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %nonassoc	SET				/* see relation_expr_opt_alias */
 %left		UNION EXCEPT
 %left		INTERSECT
+%left		DISTINCT
+%left		ON
 %left		OR
 %left		AND
 %right		NOT
@@ -8938,11 +8945,13 @@ DeallocateStmt: DEALLOCATE name
  *****************************************************************************/
 
 InsertStmt:
-			opt_with_clause INSERT INTO qualified_name insert_rest returning_clause
+			opt_with_clause INSERT INTO qualified_name insert_rest
+			opt_on_duplicate_key opt_returning_clause
 				{
 					$5->relation = $4;
-					$5->returningList = $6;
+					$5->rlist = $7;
 					$5->withClause = $1;
+					$5->specClause = $6;
 					$$ = (Node *) $5;
 				}
 		;
@@ -8986,9 +8995,45 @@ insert_column_item:
 				}
 		;
 
-returning_clause:
-			RETURNING target_list		{ $$ = $2; }
-			| /* EMPTY */				{ $$ = NIL; }
+opt_on_duplicate_key:
+			ON DUPLICATE KEY LOCK_P FOR UPDATE
+				{
+					$$ = SPEC_UPDATE;
+				}
+			|
+			ON DUPLICATE KEY IGNORE
+				{
+					$$ = SPEC_IGNORE;
+				}
+			| /*EMPTY*/
+				{
+					$$ = SPEC_NONE;
+				}
+		;
+
+opt_rejects:
+			REJECTS
+				{
+					$$ = TRUE;
+				}
+			| /*EMPTY*/
+				{
+					$$ = FALSE;
+				}
+		;
+
+opt_returning_clause:
+			RETURNING opt_rejects target_list
+				{
+					$$ = makeNode(ReturningClause);
+					$$->returningList = $3;
+					$$->rejects = $2;
+					$$->location = @1;
+				}
+			| /* EMPTY */
+				{
+					$$ = NULL;
+				}
 		;
 
 
@@ -9000,13 +9045,13 @@ returning_clause:
  *****************************************************************************/
 
 DeleteStmt: opt_with_clause DELETE_P FROM relation_expr_opt_alias
-			using_clause where_or_current_clause returning_clause
+			using_clause where_or_current_clause opt_returning_clause
 				{
 					DeleteStmt *n = makeNode(DeleteStmt);
 					n->relation = $4;
 					n->usingClause = $5;
 					n->whereClause = $6;
-					n->returningList = $7;
+					n->rlist = $7;
 					n->withClause = $1;
 					$$ = (Node *)n;
 				}
@@ -9066,14 +9111,14 @@ UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
 			SET set_clause_list
 			from_clause
 			where_or_current_clause
-			returning_clause
+			opt_returning_clause
 				{
 					UpdateStmt *n = makeNode(UpdateStmt);
 					n->relation = $3;
 					n->targetList = $5;
 					n->fromClause = $6;
 					n->whereClause = $7;
-					n->returningList = $8;
+					n->rlist = $8;
 					n->withClause = $1;
 					$$ = (Node *)n;
 				}
@@ -12704,6 +12749,7 @@ unreserved_keyword:
 			| DOMAIN_P
 			| DOUBLE_P
 			| DROP
+			| DUPLICATE
 			| EACH
 			| ENABLE_P
 			| ENCODING
@@ -12734,6 +12780,7 @@ unreserved_keyword:
 			| HOUR_P
 			| IDENTITY_P
 			| IF_P
+			| IGNORE
 			| IMMEDIATE
 			| IMMUTABLE
 			| IMPLICIT_P
@@ -13060,6 +13107,7 @@ reserved_keyword:
 			| PLACING
 			| PRIMARY
 			| REFERENCES
+			| REJECTS
 			| RETURNING
 			| SELECT
 			| SESSION_USER

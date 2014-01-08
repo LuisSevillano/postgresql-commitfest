@@ -336,6 +336,7 @@ _outModifyTable(StringInfo str, const ModifyTable *node)
 	WRITE_NODE_FIELD(returningLists);
 	WRITE_NODE_FIELD(fdwPrivLists);
 	WRITE_NODE_FIELD(rowMarks);
+	WRITE_ENUM_FIELD(spec, SpecType);
 	WRITE_INT_FIELD(epqParam);
 }
 
@@ -2253,6 +2254,7 @@ _outQuery(StringInfo str, const Query *node)
 	WRITE_NODE_FIELD(jointree);
 	WRITE_NODE_FIELD(targetList);
 	WRITE_NODE_FIELD(withCheckOptions);
+	WRITE_ENUM_FIELD(specClause, SpecType);
 	WRITE_NODE_FIELD(returningList);
 	WRITE_NODE_FIELD(groupClause);
 	WRITE_NODE_FIELD(havingQual);
@@ -2322,6 +2324,16 @@ _outWithClause(StringInfo str, const WithClause *node)
 
 	WRITE_NODE_FIELD(ctes);
 	WRITE_BOOL_FIELD(recursive);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outReturningClause(StringInfo str, const ReturningClause *node)
+{
+	WRITE_NODE_TYPE("RETURNINGCLAUSE");
+
+	WRITE_NODE_FIELD(returningList);
+	WRITE_BOOL_FIELD(rejects);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -3158,6 +3170,9 @@ _outNode(StringInfo str, const void *obj)
 				break;
 			case T_WithClause:
 				_outWithClause(str, obj);
+				break;
+			case T_ReturningClause:
+				_outReturningClause(str, obj);
 				break;
 			case T_CommonTableExpr:
 				_outCommonTableExpr(str, obj);

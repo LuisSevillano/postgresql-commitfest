@@ -534,6 +534,8 @@ DATA(insert OID = 330 (  btgettuple		   PGNSP PGUID 12 1 0 0 0 f f f f t f v 2 0
 DESCR("btree(internal)");
 DATA(insert OID = 636 (  btgetbitmap	   PGNSP PGUID 12 1 0 0 0 f f f f t f v 2 0 20 "2281 2281" _null_ _null_ _null_ _null_	btgetbitmap _null_ _null_ _null_ ));
 DESCR("btree(internal)");
+DATA(insert OID = 3179 (  btlock		   PGNSP PGUID 12 1 0 0 0 f f f f t f v 6 0 2278 "2281 2281 2281 2281 2281 16" _null_ _null_ _null_ _null_	btlock _null_ _null_ _null_ ));
+DESCR("btree(internal)");
 DATA(insert OID = 331 (  btinsert		   PGNSP PGUID 12 1 0 0 0 f f f f t f v 6 0 16 "2281 2281 2281 2281 2281 2281" _null_ _null_ _null_ _null_	btinsert _null_ _null_ _null_ ));
 DESCR("btree(internal)");
 DATA(insert OID = 333 (  btbeginscan	   PGNSP PGUID 12 1 0 0 0 f f f f t f v 3 0 2281 "2281 2281 2281" _null_ _null_ _null_ _null_	btbeginscan _null_ _null_ _null_ ));

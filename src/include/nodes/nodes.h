@@ -404,6 +404,7 @@ typedef enum NodeTag
 	T_RowMarkClause,
 	T_XmlSerialize,
 	T_WithClause,
+	T_ReturningClause,
 	T_CommonTableExpr,
 
 	/*
@@ -547,6 +548,19 @@ typedef enum CmdType
 								 * with qual */
 } CmdType;
 
+/* SpecType -
+ *	  "Speculative insertion" clause
+ *
+ * This also appears across various subsystems
+ */
+typedef enum
+{
+	SPEC_NONE,				/* No reason to insert speculatively */
+	SPEC_IGNORE,			/* "ON DUPLICATE KEY IGNORE" */
+	SPEC_IGNORE_REJECTS,	/* same as SPEC_IGNORE, plus RETURNING rejected */
+	SPEC_UPDATE,			/* "ON DUPLICATE KEY LOCK FOR UPDATE" */
+	SPEC_UPDATE_REJECTS		/* same as SPEC_UPDATE, plus RETURNING rejected */
+} SpecType;
 
 /*
  * JoinType -

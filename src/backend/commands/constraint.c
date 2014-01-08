@@ -162,7 +162,7 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 		 * that has already been inserted is unique.
 		 */
 		index_insert(indexRel, values, isnull, &(new_row->t_self),
-					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING);
+					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING, NULL);
 	}
 	else
 	{
