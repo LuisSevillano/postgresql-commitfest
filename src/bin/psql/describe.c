@@ -579,7 +579,7 @@ describeTypes(const char *pattern, bool verbose, bool showSystem)
 /* \do
  */
 bool
-describeOperators(const char *pattern, bool showSystem)
+describeOperators(const char *pattern, bool verbose, bool showSystem)
 {
 	PQExpBufferData buf;
 	PGresult   *res;
@@ -605,17 +605,36 @@ describeOperators(const char *pattern, bool showSystem)
 					  "  o.oprname AS \"%s\",\n"
 					  "  CASE WHEN o.oprkind='l' THEN NULL ELSE pg_catalog.format_type(o.oprleft, NULL) END AS \"%s\",\n"
 					  "  CASE WHEN o.oprkind='r' THEN NULL ELSE pg_catalog.format_type(o.oprright, NULL) END AS \"%s\",\n"
-				   "  pg_catalog.format_type(o.oprresult, NULL) AS \"%s\",\n"
-			 "  coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'),\n"
-	"           pg_catalog.obj_description(o.oprcode, 'pg_proc')) AS \"%s\"\n"
-					  "FROM pg_catalog.pg_operator o\n"
-	  "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace\n",
+					  "  pg_catalog.format_type(o.oprresult, NULL) AS \"%s\",\n"
+					  "  coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'),\n"
+					  "           pg_catalog.obj_description(o.oprcode, 'pg_proc')) AS \"%s\"\n",
 					  gettext_noop("Schema"),
 					  gettext_noop("Name"),
 					  gettext_noop("Left arg type"),
 					  gettext_noop("Right arg type"),
 					  gettext_noop("Result type"),
 					  gettext_noop("Description"));
+
+	if (verbose)
+		appendPQExpBuffer(&buf,
+						  ",\n  o.oprcode AS \"%s\",\n"
+						  "  CASE\n"
+						  "    WHEN p.provolatile = 'i' THEN '%s'\n"
+						  "    WHEN p.provolatile = 's' THEN '%s'\n"
+						  "    WHEN p.provolatile = 'v' THEN '%s'\n"
+						  "  END AS \"%s\"\n",
+						  gettext_noop("Function"),
+						  gettext_noop("immutable"),
+						  gettext_noop("stable"),
+						  gettext_noop("volatile"),
+						  gettext_noop("Volatility"));
+
+	appendPQExpBuffer(&buf,
+					  "FROM pg_catalog.pg_operator o\n"
+					  "     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace\n");
+	if (verbose)
+		appendPQExpBuffer(&buf,
+						  "\n    LEFT JOIN pg_catalog.pg_proc p ON p.oid = o.oprcode\n");
 
 	if (!showSystem && !pattern)
 		appendPQExpBufferStr(&buf, "WHERE n.nspname <> 'pg_catalog'\n"
