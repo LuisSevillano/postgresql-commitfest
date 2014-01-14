@@ -74,7 +74,9 @@
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 
@@ -110,6 +112,11 @@ int			Log_error_verbosity = PGERROR_VERBOSE;
 char	   *Log_line_prefix = NULL;		/* format for extra log line info */
 int			Log_destination = LOG_DESTINATION_STDERR;
 char	   *Log_destination_string = NULL;
+
+static uint64 *log_sqlstate_error_statement = NULL;
+static size_t log_sqlstate_error_statement_len = 0;
+
+static int	get_sqlstate_error_level(int sqlstate);
 
 #ifdef HAVE_SYSLOG
 
@@ -2496,6 +2503,7 @@ static void
 write_csvlog(ErrorData *edata)
 {
 	StringInfoData buf;
+	int			requested_log_level;
 	bool		print_stmt = false;
 
 	/* static counter for line numbers */
@@ -2639,7 +2647,10 @@ write_csvlog(ErrorData *edata)
 	appendStringInfoChar(&buf, ',');
 
 	/* user query --- only reported if not disabled by the caller */
-	if (is_log_level_output(edata->elevel, log_min_error_statement) &&
+	requested_log_level = get_sqlstate_error_level(edata->sqlerrcode);
+	if (requested_log_level < 0)
+		requested_log_level = log_min_error_statement;
+	if (is_log_level_output(edata->elevel, requested_log_level) &&
 		debug_query_string != NULL &&
 		!edata->hide_stmt)
 		print_stmt = true;
@@ -2712,6 +2723,7 @@ static void
 send_message_to_server_log(ErrorData *edata)
 {
 	StringInfoData buf;
+	int			requested_log_level;
 
 	initStringInfo(&buf);
 
@@ -2796,7 +2808,10 @@ send_message_to_server_log(ErrorData *edata)
 	/*
 	 * If the user wants the query that generated this error logged, do it.
 	 */
-	if (is_log_level_output(edata->elevel, log_min_error_statement) &&
+	requested_log_level = get_sqlstate_error_level(edata->sqlerrcode);
+	if (requested_log_level < 0)
+		requested_log_level = log_min_error_statement;
+	if (is_log_level_output(edata->elevel, requested_log_level) &&
 		debug_query_string != NULL &&
 		!edata->hide_stmt)
 	{
@@ -3597,4 +3612,205 @@ trace_recovery(int trace_level)
 		return LOG;
 
 	return trace_level;
+}
+
+
+/*
+ * Statement log error level can be overriden per sqlstate, the variable
+ * log_sqlstate_error_statement is a sorted array of
+ * log_sqlstate_error_statement_len uint64s where the high 32 bits contain
+ * the sqlstate and low 32 bits contain the required error level.
+ */
+
+/*
+ * get_sqlstate_error_level - perform a binary search for the requested
+ * state and return if it was found; return -1 if it was not found.
+ */
+static int
+get_sqlstate_error_level(int sqlstate)
+{
+	uint64		left = 0,
+				right = log_sqlstate_error_statement_len;
+
+	while (left < right)
+	{
+		uint64		middle = left + (right - left) / 2;
+		int			m_sqlstate = log_sqlstate_error_statement[middle] >> 32;
+
+		if (m_sqlstate == sqlstate)
+			return log_sqlstate_error_statement[middle] & 0xFFFFFFFF;
+		else if (m_sqlstate < sqlstate)
+			left = middle + 1;
+		else
+			right = middle;
+	}
+	return -1;
+}
+
+/*
+ * check_log_sqlstate_error - validate sqlstate:errorlevel lists and create
+ * sorted uint64 arrays from them; last occurance of each sqlstate is used.
+ */
+bool
+check_log_sqlstate_error(char **newval, void **extra, GucSource source)
+{
+	const struct config_enum_entry *enum_entry;
+	char	   *rawstring,
+			   *new_newval,
+			   *new_newval_end,
+			   *vptr;
+	List	   *elemlist;
+	ListCell   *l;
+	uint64	   *new_array = NULL;
+	int			i,
+				new_array_len = 0;
+
+	/* Need a modifiable copy of string */
+	rawstring = pstrdup(*newval);
+
+	/* Parse string into list of identifiers */
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	/*
+	 * GUC wants malloced results, allocate room for as many elements on the
+	 * list plus one to hold the array size
+	 */
+	new_array = (uint64 *) malloc(sizeof(uint64) * (list_length(elemlist) + 1));
+	if (!new_array)
+	{
+		pfree(rawstring);
+		list_free(elemlist);
+		return false;
+	}
+
+	/* validate list and insert the results in a sorted array */
+	foreach(l, elemlist)
+	{
+		char	   *tok = lfirst(l),
+				   *level_str = strchr(tok, ':');
+		int			level = -1,
+					sqlstate;
+		uint64		value;
+
+		if (level_str != NULL && (level_str - tok) == 5)
+		{
+			for (enum_entry = server_message_level_options;
+				 enum_entry && enum_entry->name;
+				 enum_entry++)
+			{
+				if (pg_strcasecmp(enum_entry->name, level_str + 1) == 0)
+				{
+					level = enum_entry->val;
+					break;
+				}
+			}
+		}
+		if (level < 0)
+		{
+			GUC_check_errdetail("Invalid sqlstate error definition: \"%s\".", tok);
+			new_array_len = -1;
+			break;
+		}
+		sqlstate = MAKE_SQLSTATE(pg_ascii_toupper(tok[0]), pg_ascii_toupper(tok[1]),
+								 pg_ascii_toupper(tok[2]), pg_ascii_toupper(tok[3]),
+								 pg_ascii_toupper(tok[4]));
+		value = (((uint64) sqlstate) << 32) | ((uint64) level);
+
+		for (i = 0; i <= new_array_len; i++)
+		{
+			if (i == new_array_len)
+			{
+				new_array[++new_array_len] = value;
+				break;
+			}
+			else if (sqlstate == (int) (new_array[i + 1] >> 32))
+			{
+				new_array[i + 1] = value;
+				break;
+			}
+			else if (sqlstate < (int) (new_array[i + 1] >> 32))
+			{
+				memmove(&new_array[i + 2], &new_array[i + 1],
+						(new_array_len - i) * sizeof(uint64));
+				++new_array_len;
+				new_array[i + 1] = value;
+				break;
+			}
+		}
+	}
+
+	pfree(rawstring);
+	list_free(elemlist);
+
+	if (new_array_len < 0)
+	{
+		free(new_array);
+		return false;
+	}
+
+	/* store the length in the first field */
+	new_array[0] = new_array_len;
+
+	/*
+	 * calculate the maximum length for the canonical string and
+	 * allocate a buffer for it.  sqlstate is always 5 characters and
+	 * the longest error level string currently is 'warning'.
+	 */
+	new_newval = (char *) malloc(strlen("XX000:warning,") * new_array_len + 1);
+	if (!new_newval)
+	{
+		free(new_array);
+		return false;
+	}
+
+	vptr = new_newval;
+	for (i = 1; i <= new_array_len; i++)
+	{
+		const char *level_str = "null";
+
+		for (enum_entry = server_message_level_options;
+			 enum_entry && enum_entry->name;
+			 enum_entry++)
+		{
+			if (enum_entry->val == (new_array[i] & 0xFFFFFFFF))
+			{
+				level_str = enum_entry->name;
+				break;
+			}
+		}
+
+		vptr += snprintf(vptr, new_newval_end - vptr, "%s%s:%s",
+						 (i > 1) ? "," : "",
+						 unpack_sql_state(new_array[i] >> 32),
+						 level_str);
+	}
+	*vptr = 0;
+
+	free(*newval);
+	*newval = new_newval;
+	*extra = new_array;
+
+	return true;
+}
+
+/*
+ * assign_log_sqlstate_error - take the array generated by
+ * check_log_sqlstate_error into use.  'extra' is an array of uint64s where
+ * the first element contains the list length and the remainder is
+ * sqlstate:errorlevel values.
+ */
+void
+assign_log_sqlstate_error(const char *newval, void *extra)
+{
+	uint64	   *myextra = (uint64 *) extra;
+
+	log_sqlstate_error_statement_len = myextra[0];
+	log_sqlstate_error_statement = &myextra[1];
 }
