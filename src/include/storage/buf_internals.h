@@ -40,6 +40,7 @@
 #define BM_CHECKPOINT_NEEDED	(1 << 7)		/* must write for checkpoint */
 #define BM_PERMANENT			(1 << 8)		/* permanent relation (not
 												 * unlogged) */
+#define BM_FADVED		(1 << 9)			/* remove duplicate file cache flag */
 
 typedef bits16 BufFlags;
 

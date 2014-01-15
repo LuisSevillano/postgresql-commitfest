@@ -69,6 +69,7 @@
 /* GUC variables */
 bool		zero_damaged_pages = false;
 int			bgwriter_lru_maxpages = 100;
+int		DropDuplicateBuffers = -1;
 double		bgwriter_lru_multiplier = 2.0;
 bool		track_io_timing = false;
 
@@ -111,6 +112,7 @@ static volatile BufferDesc *BufferAlloc(SMgrRelation smgr,
 static void FlushBuffer(volatile BufferDesc *buf, SMgrRelation reln);
 static void AtProcExit_Buffers(int code, Datum arg);
 static int	rnode_comparator(const void *p1, const void *p2);
+static void DropDuplicateOSCache(volatile BufferDesc *bufHdr);
 
 
 /*
@@ -838,7 +840,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * 1 so that the buffer can survive one clock-sweep pass.)
 	 */
 	buf->tag = newTag;
-	buf->flags &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT);
+	buf->flags &= ~(BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_PERMANENT | BM_FADVED);
 	if (relpersistence == RELPERSISTENCE_PERMANENT)
 		buf->flags |= BM_TAG_VALID | BM_PERMANENT;
 	else
@@ -1104,7 +1106,18 @@ PinBuffer(volatile BufferDesc *buf, BufferAccessStrategy strategy)
 		if (strategy == NULL)
 		{
 			if (buf->usage_count < BM_MAX_USAGE_COUNT)
+			{
 				buf->usage_count++;
+
+				/*
+				 * If the buffer is clean, we can remove duplicate buffers
+				 * from the file cache in OS without physical disk writing,
+				 * which is for more efficient whole memory using. It is needed
+				 * to execute at once per buffers.
+				 */
+				if (!(buf->flags & BM_FADVED) && !(buf->flags & BM_JUST_DIRTIED))
+					DropDuplicateOSCache(buf);
+			}
 		}
 		else
 		{
@@ -1956,6 +1969,9 @@ FlushBuffer(volatile BufferDesc *buf, SMgrRelation reln)
 	 */
 	recptr = BufferGetLSN(buf);
 
+	/* mark this buffer's file cache in OS isn't clean */
+	buf->flags |= BM_FADVED;
+
 	/* To check if block content changes while flushing. - vadim 01/17/97 */
 	buf->flags &= ~BM_JUST_DIRTIED;
 	UnlockBufHdr(buf);
@@ -2102,6 +2118,28 @@ BufferGetLSNAtomic(Buffer buffer)
 	UnlockBufHdr(bufHdr);
 
 	return lsn;
+}
+
+/*
+ * Drop duplicate OS cache which is in OS and shared_buffers. This purpose
+ * is for more efficient file cache space and dirty file cache management.
+ */
+static void
+DropDuplicateOSCache(volatile BufferDesc *bufHdr)
+{
+	SMgrRelation    reln;
+	MdfdVec         *v;
+	off_t           seekpos;
+
+	/* Drop OS cache which is higher usage_count in shared_buffer */
+	if(DropDuplicateBuffers != -1 && bufHdr->usage_count >= DropDuplicateBuffers)
+	{
+		reln = smgropen(bufHdr->tag.rnode, InvalidBackendId);
+		v = _mdfd_getseg(reln, bufHdr->tag.forkNum, bufHdr->tag.blockNum, false, 0);
+		seekpos = (off_t) BLCKSZ *(bufHdr->tag.blockNum % ((BlockNumber) RELSEG_SIZE));
+		FileCacheAdvise(v->mdfd_vfd, seekpos, (off_t) BLCKSZ, POSIX_FADV_DONTNEED);
+		bufHdr->flags |= BM_FADVED;
+	}
 }
 
 /* ---------------------------------------------------------------------
@@ -2417,6 +2455,8 @@ FlushRelationBuffers(Relation rel)
 				error_context_stack = &errcallback;
 
 				PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
+				
+				bufHdr->flags |= BM_FADVED;
 
 				smgrwrite(rel->rd_smgr,
 						  bufHdr->tag.forkNum,

@@ -383,6 +383,21 @@ pg_flush_data(int fd, off_t offset, off_t amount)
 	return 0;
 }
 
+/*
+ * pg_fadvise --- advise OS that the cache will need or not
+ *
+ * Not all platforms have posix_fadvise. If it does not support posix_fadvise,
+ * we do nothing about here.
+ */
+int
+pg_fadvise(int fd, off_t offset, off_t amount, int advise)
+{
+#if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
+	return posix_fadvise(fd, offset, amount, advise);
+#else
+	return 0;
+#endif
+}
 
 /*
  * fsync_fname -- fsync a file or directory, handling errors properly
@@ -1139,6 +1154,15 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
 	}
 
 	return file;
+}
+
+/*
+ * Controling OS file cache using posix_fadvise()
+ */
+int
+FileCacheAdvise(File file, off_t offset, off_t amount, int advise)
+{
+	return pg_fadvise(VfdCache[file].fd, offset, amount, advise);
 }
 
 /*

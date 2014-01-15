@@ -1107,6 +1107,24 @@ include 'filename'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-drop-duplicate-buffers" xreflabel="drop-duplicate-buffers">
+      <term><varname>drop-duplicate-buffers</varname> (<type>integer</type>)</term>
+      <indexterm>
+       <primary><varname>drop-duplicate-buffers</> configuration parameter</primary>
+      </indexterm>
+      <listitem>
+       <para>
+        Sets target min usage count in shared_buffers, which is droped in file cache.
+        When you use this parameter, you set large shared_buffers that is about 50% 
+        or higher, and set parameter with 4 or 5. It need to set carefuly. If you 
+        use this parameter with small shared_buffers, transaction performance will be
+        decliend. This parameter is needed to support posix_fadvise() system call.
+        If your system doesn't support posix_fadvise(), it doesn't work at all.
+       </para>
+
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-temp-buffers" xreflabel="temp_buffers">
       <term><varname>temp_buffers</varname> (<type>integer</type>)</term>
       <indexterm>

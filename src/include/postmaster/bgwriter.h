@@ -23,6 +23,7 @@
 extern int	BgWriterDelay;
 extern int	CheckPointTimeout;
 extern int	CheckPointWarning;
+extern int	DropDuplicateBuffers;
 extern double CheckPointCompletionTarget;
 
 extern void BackgroundWriterMain(void) __attribute__((noreturn));

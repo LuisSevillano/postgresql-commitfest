@@ -61,6 +61,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/dsm_impl.h"
 #include "storage/standby.h"
 #include "storage/fd.h"
@@ -2052,6 +2053,16 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&CheckPointWarning,
 		30, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"drop_duplicate_buffers", PGC_SIGHUP, RESOURCES_CHECKPOINTER,
+			gettext_noop("drop duplicate buffers in OS file cache"),
+			NULL
+		},
+		&DropDuplicateBuffers,
+		-1, -1, BM_MAX_USAGE_COUNT,
 		NULL, NULL, NULL
 	},
 

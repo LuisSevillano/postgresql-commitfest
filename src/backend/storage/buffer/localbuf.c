@@ -204,6 +204,8 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 
 		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
+		bufHdr->flags |= BM_FADVED;
+
 		/* And write... */
 		smgrwrite(oreln,
 				  bufHdr->tag.forkNum,

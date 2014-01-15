@@ -17,7 +17,7 @@
 #include "fmgr.h"
 #include "storage/block.h"
 #include "storage/relfilenode.h"
-
+#include "storage/fd.h"
 
 /*
  * smgr.c maintains a table of SMgrRelation objects, which are essentially
@@ -76,6 +76,21 @@ typedef SMgrRelationData *SMgrRelation;
 #define SmgrIsTemp(smgr) \
 	RelFileNodeBackendIsTemp((smgr)->smgr_rnode)
 
+/* If you want to get more detail about MdfdVec, you read src/storage/smgr/md.c */
+typedef struct _MdfdVec
+{
+	File		mdfd_vfd;	/* fd number in fd.c's pool */
+	BlockNumber mdfd_segno;		/* segment number, from 0 */
+	struct _MdfdVec *mdfd_chain;	/* next segment, or NULL */
+} MdfdVec;
+
+typedef enum		/* behavior for mdopen & _mdfd_getseg */
+{
+	EXTENSION_FAIL,			/* ereport if segment not present */
+	EXTENSION_RETURN_NULL,		/* return NULL if not present */
+	EXTENSION_CREATE		/* create new segments as needed */
+} ExtensionBehavior;
+
 extern void smgrinit(void);
 extern SMgrRelation smgropen(RelFileNode rnode, BackendId backend);
 extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);
@@ -128,6 +143,8 @@ extern void mdimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void mdpreckpt(void);
 extern void mdsync(void);
 extern void mdpostckpt(void);
+extern MdfdVec *_mdfd_getseg(SMgrRelation reln, ForkNumber forkno,
+		BlockNumber blkno, bool skipFsync, ExtensionBehavior behavior);
 
 extern void SetForwardFsyncRequests(void);
 extern void RememberFsyncRequest(RelFileNode rnode, ForkNumber forknum,

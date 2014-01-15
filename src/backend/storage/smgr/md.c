@@ -109,13 +109,6 @@
  *	All MdfdVec objects are palloc'd in the MdCxt memory context.
  */
 
-typedef struct _MdfdVec
-{
-	File		mdfd_vfd;		/* fd number in fd.c's pool */
-	BlockNumber mdfd_segno;		/* segment number, from 0 */
-	struct _MdfdVec *mdfd_chain;	/* next segment, or NULL */
-} MdfdVec;
-
 static MemoryContext MdCxt;		/* context for all md.c allocations */
 
 
@@ -163,13 +156,6 @@ static CycleCtr mdsync_cycle_ctr = 0;
 static CycleCtr mdckpt_cycle_ctr = 0;
 
 
-typedef enum					/* behavior for mdopen & _mdfd_getseg */
-{
-	EXTENSION_FAIL,				/* ereport if segment not present */
-	EXTENSION_RETURN_NULL,		/* return NULL if not present */
-	EXTENSION_CREATE			/* create new segments as needed */
-} ExtensionBehavior;
-
 /* local routines */
 static void mdunlinkfork(RelFileNodeBackend rnode, ForkNumber forkNum,
 			 bool isRedo);
@@ -183,8 +169,6 @@ static char *_mdfd_segpath(SMgrRelation reln, ForkNumber forknum,
 			  BlockNumber segno);
 static MdfdVec *_mdfd_openseg(SMgrRelation reln, ForkNumber forkno,
 			  BlockNumber segno, int oflags);
-static MdfdVec *_mdfd_getseg(SMgrRelation reln, ForkNumber forkno,
-			 BlockNumber blkno, bool skipFsync, ExtensionBehavior behavior);
 static BlockNumber _mdnblocks(SMgrRelation reln, ForkNumber forknum,
 		   MdfdVec *seg);
 
@@ -1701,7 +1685,7 @@ _mdfd_openseg(SMgrRelation reln, ForkNumber forknum, BlockNumber segno,
  * segment, according to "behavior".  Note: skipFsync is only used in the
  * EXTENSION_CREATE case.
  */
-static MdfdVec *
+extern MdfdVec *
 _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			 bool skipFsync, ExtensionBehavior behavior)
 {

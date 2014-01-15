@@ -68,6 +68,7 @@ extern int	max_safe_fds;
 extern File PathNameOpenFile(FileName fileName, int fileFlags, int fileMode);
 extern File OpenTemporaryFile(bool interXact);
 extern void FileClose(File file);
+extern int	FileCacheAdvise(File file, off_t offset, off_t amount, int advise);
 extern int	FilePrefetch(File file, off_t offset, int amount);
 extern int	FileRead(File file, char *buffer, int amount);
 extern int	FileWrite(File file, char *buffer, int amount);
@@ -113,6 +114,7 @@ extern int	pg_fsync_no_writethrough(int fd);
 extern int	pg_fsync_writethrough(int fd);
 extern int	pg_fdatasync(int fd);
 extern int	pg_flush_data(int fd, off_t offset, off_t amount);
+extern int	pg_fadvise(int fd, off_t offset, off_t amount, int advise);
 extern void fsync_fname(char *fname, bool isdir);
 
 /* Filename components for OpenTemporaryFile */

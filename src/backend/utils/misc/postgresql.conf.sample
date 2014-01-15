@@ -115,6 +115,8 @@
 
 #shared_buffers = 32MB			# min 128kB
 					# (change requires restart)
+#drop_duplicate_buffers = -1            # set target min usage_count in shared_buffers
+					# -1 is disables
 #temp_buffers = 8MB			# min 800kB
 #max_prepared_transactions = 0		# zero disables the feature
 					# (change requires restart)
