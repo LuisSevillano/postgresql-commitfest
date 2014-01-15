@@ -28,11 +28,6 @@
 PG_MODULE_MAGIC;
 
 /*
- * Declarations
- */
-void		_PG_init(void);
-
-/*
  * Saved hook entries (if stacked)
  */
 static object_access_hook_type next_object_access_hook = NULL;

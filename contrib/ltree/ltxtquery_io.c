@@ -11,10 +11,7 @@
 #include "ltree.h"
 
 PG_FUNCTION_INFO_V1(ltxtq_in);
-Datum		ltxtq_in(PG_FUNCTION_ARGS);
-
 PG_FUNCTION_INFO_V1(ltxtq_out);
-Datum		ltxtq_out(PG_FUNCTION_ARGS);
 
 
 /* parser's states */

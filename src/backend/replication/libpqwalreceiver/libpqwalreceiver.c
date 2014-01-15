@@ -37,8 +37,6 @@
 
 PG_MODULE_MAGIC;
 
-void		_PG_init(void);
-
 /* Current connection to the primary, if any */
 static PGconn *streamConn = NULL;
 
