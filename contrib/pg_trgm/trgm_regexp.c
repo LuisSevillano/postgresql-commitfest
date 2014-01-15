@@ -122,9 +122,18 @@
  * thousands of trigrams would be slow, and would likely produce so many
  * false positives that we would have to traverse a large fraction of the
  * index, the graph is simplified further in a lossy fashion by removing
- * color trigrams until the number of trigrams after expansion is below
- * the MAX_TRGM_COUNT threshold.  When a color trigram is removed, the states
- * connected by any arcs labelled with that trigram are merged.
+ * color trigrams. Also, trigrams itself have not equivalent value: some of
+ * them are more frequent and some of them are less frequent. Wishfully, we
+ * would like to know the distribution of trigrams, but we don't. But because
+ * of padding we for sure know that empty character is much more frequent than
+ * others. We assume it to be in BLANK_COLOR_SIZE more frequent than average
+ * frequency of other characters. Assuming that we intruduce "size of color
+ * trigram" which is like number of trigrams in color trigram except that
+ * empty color counts as BLANK_COLOR_SIZE. While removing color trigrams we're
+ * trying to minimize it's summary size. We would like to achieve
+ * WISH_TRGM_SIZE and assume fail if we don't reach MAX_TRGM_SIZE threshold.
+ * When a color trigram is removed, the states connected by any arcs labelled
+ * with that trigram are merged.
  *
  * 4) Pack the graph into a compact representation
  * -----------------------------------------------
@@ -198,13 +207,18 @@
  *
  *	MAX_EXPANDED_STATES - How many states we allow in expanded graph
  *	MAX_EXPANDED_ARCS - How many arcs we allow in expanded graph
- *	MAX_TRGM_COUNT - How many simple trigrams we allow to be extracted
+ *	MAX_TRGM_SIZE - What largest size of color trigrams we allow
+ *	WISH_TRGM_SIZE - Desired size of color trigrams
  *	COLOR_COUNT_LIMIT - Maximum number of characters per color
+ *	BLANK_COLOR_SIZE - How much blank character is more frequent than
+ *	                   other character in average
  */
 #define MAX_EXPANDED_STATES 128
 #define MAX_EXPANDED_ARCS	1024
-#define MAX_TRGM_COUNT		256
+#define MAX_TRGM_SIZE		256
+#define WISH_TRGM_SIZE		16
 #define COLOR_COUNT_LIMIT	256
+#define BLANK_COLOR_SIZE	32
 
 /* Struct representing a single pg_wchar, converted back to multibyte form */
 typedef struct
@@ -460,6 +474,7 @@ static void fillTrgm(trgm *ptrgm, trgm_mb_char s[3]);
 static void mergeStates(TrgmState *state1, TrgmState *state2);
 static int	colorTrgmInfoCmp(const void *p1, const void *p2);
 static int	colorTrgmInfoCountCmp(const void *p1, const void *p2);
+static int	getColorTrigramSize(const ColorTrgmInfo *colorTrgm);
 static TrgmPackedGraph *packGraph(TrgmNFA *trgmNFA, MemoryContext rcontext);
 static int	packArcInfoCmp(const void *a1, const void *a2);
 
@@ -1423,7 +1438,7 @@ selectColorTrigrams(TrgmNFA *trgmNFA)
 				i;
 	TrgmState  *state;
 	ColorTrgmInfo *colorTrgms;
-	int64		totalTrgmCount;
+	int64		totalTrgmSize;
 	int			number;
 
 	/* Collect color trigrams from all arcs */
@@ -1489,7 +1504,7 @@ selectColorTrigrams(TrgmNFA *trgmNFA)
 	 * 1290.  However, the grand total totalTrgmCount might conceivably
 	 * overflow an int, so we use int64 for that within this routine.
 	 */
-	totalTrgmCount = 0;
+	totalTrgmSize = 0;
 	for (i = 0; i < trgmNFA->colorTrgmsCount; i++)
 	{
 		ColorTrgmInfo *trgmInfo = &colorTrgms[i];
@@ -1504,25 +1519,25 @@ selectColorTrigrams(TrgmNFA *trgmNFA)
 				count *= trgmNFA->colorInfo[c].wordCharsCount;
 		}
 		trgmInfo->count = count;
-		totalTrgmCount += count;
+		totalTrgmSize += getColorTrigramSize(trgmInfo);
 	}
 
-	/* Sort color trigrams in descending order of simple trigram counts */
+	/* Sort color trigrams in descending order of their "sizes" */
 	qsort(colorTrgms, trgmNFA->colorTrgmsCount, sizeof(ColorTrgmInfo),
 		  colorTrgmInfoCountCmp);
 
 	/*
-	 * Remove color trigrams from the graph so long as total number of simple
-	 * trigrams exceeds MAX_TRGM_COUNT.  We prefer to remove color trigrams
-	 * with the most associated simple trigrams, since those are the most
-	 * promising for reducing the total number of simple trigrams.	When
-	 * removing a color trigram we have to merge states connected by arcs
+	 * Remove color trigrams from the graph so long as total size of color
+	 * trigrams exceeds WISH_TRGM_SIZE. But if we can't reach WISH_TRGM_SIZE
+	 * it's OK to be in MAX_TRGM_SIZE. We prefer to remove largest color
+	 * trigrams, since those are the most promising for reducing the total size.
+	 * When removing a color trigram we have to merge states connected by arcs
 	 * labeled with that trigram.  It's necessary to not merge initial and
 	 * final states, because our graph becomes useless if that happens; so we
 	 * cannot always remove the trigram we'd prefer to.
 	 */
 	for (i = 0;
-		 (i < trgmNFA->colorTrgmsCount) && (totalTrgmCount > MAX_TRGM_COUNT);
+		 (i < trgmNFA->colorTrgmsCount) && (totalTrgmSize > WISH_TRGM_SIZE);
 		 i++)
 	{
 		ColorTrgmInfo *trgmInfo = &colorTrgms[i];
@@ -1572,14 +1587,14 @@ selectColorTrigrams(TrgmNFA *trgmNFA)
 
 		/* Mark trigram unexpanded, and update totalTrgmCount */
 		trgmInfo->expanded = false;
-		totalTrgmCount -= trgmInfo->count;
+		totalTrgmSize -= getColorTrigramSize(trgmInfo);
 	}
 
-	/* Did we succeed in fitting into MAX_TRGM_COUNT? */
-	if (totalTrgmCount > MAX_TRGM_COUNT)
+	/* Did we succeed in fitting into MAX_TRGM_SIZE? */
+	if (totalTrgmSize > MAX_TRGM_SIZE)
 		return false;
 
-	trgmNFA->totalTrgmCount = (int) totalTrgmCount;
+	trgmNFA->totalTrgmCount = (int) totalTrgmSize;
 
 	/*
 	 * Sort color trigrams by colors (will be useful for bsearch in packGraph)
@@ -1751,15 +1766,32 @@ colorTrgmInfoCmp(const void *p1, const void *p2)
 static int
 colorTrgmInfoCountCmp(const void *p1, const void *p2)
 {
-	const ColorTrgmInfo *c1 = (const ColorTrgmInfo *) p1;
-	const ColorTrgmInfo *c2 = (const ColorTrgmInfo *) p2;
+	int count1 = getColorTrigramSize((const ColorTrgmInfo *) p1);
+	int count2 = getColorTrigramSize((const ColorTrgmInfo *) p2);
 
-	if (c1->count < c2->count)
+	if (count1 < count2)
 		return 1;
-	else if (c1->count == c2->count)
+	else if (count1 == count2)
 		return 0;
 	else
 		return -1;
+}
+
+/*
+ * Return size of color trigrams assuming count containing of trigrams
+ * is already calculated.
+ */
+static int
+getColorTrigramSize(const ColorTrgmInfo *colorTrgm)
+{
+	int count = colorTrgm->count, i;
+
+	for (i = 0; i < 3; i++)
+	{
+		if (colorTrgm->ctrgm.colors[i] == COLOR_BLANK)
+			count *= BLANK_COLOR_SIZE;
+	}
+	return count;
 }
 
 
