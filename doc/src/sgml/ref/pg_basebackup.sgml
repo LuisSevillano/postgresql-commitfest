@@ -189,6 +189,27 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-r <replaceable class="parameter">rate</replaceable></option></term>
+      <term><option>--max-rate=<replaceable class="parameter">rate</replaceable></option></term>
+      <listitem>
+       <para>
+        The maximum amount of data transferred from server per second.
+        The purpose is to limit the impact of <application>pg_basebackup</application>
+        on the running server.
+       </para>
+       <para>
+        This option always affects transfer of the data directory. Transfer of
+        WAL files is only affected if the collection method is <literal>fetch</literal>.
+       </para>
+       <para>
+        Valid values are between <literal>32 kB</literal> and <literal>1024 MB</literal>
+        is expected. Suffixes <literal>k</literal> (kilobytes) and
+        <literal>M</literal> (megabytes) are accepted.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-R</option></term>
       <term><option>--write-recovery-conf</option></term>
       <listitem>

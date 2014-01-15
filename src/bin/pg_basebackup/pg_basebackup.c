@@ -46,6 +46,7 @@ static bool	streamwal = false;
 static bool	fastcheckpoint = false;
 static bool	writerecoveryconf = false;
 static int	standby_message_timeout = 10 * 1000;		/* 10 sec = default */
+static uint32 maxrate = 0;		/* no limit by default */
 
 /* Progress counters */
 static uint64 totalsize;
@@ -76,6 +77,7 @@ static PQExpBuffer recoveryconfcontents = NULL;
 static void usage(void);
 static void verify_dir_is_empty_or_create(char *dirname);
 static void progress_report(int tablespacenum, const char *filename);
+static uint32 parse_max_rate(char *src);
 
 static void ReceiveTarFile(PGconn *conn, PGresult *res, int rownum);
 static void ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum);
@@ -111,6 +113,7 @@ usage(void)
 	printf(_("\nOptions controlling the output:\n"));
 	printf(_("  -D, --pgdata=DIRECTORY receive base backup into directory\n"));
 	printf(_("  -F, --format=p|t       output format (plain (default), tar)\n"));
+	printf(_("  -r, --max-rate=RATE    maximum transfer rate to transfer data directory\n"));
 	printf(_("  -R, --write-recovery-conf\n"
 			 "                         write recovery.conf after backup\n"));
 	printf(_("  -x, --xlog             include required WAL files in backup (fetch mode)\n"));
@@ -475,6 +478,86 @@ progress_report(int tablespacenum, const char *filename)
 	fprintf(stderr, "\r");
 }
 
+static uint32
+parse_max_rate(char *src)
+{
+	double		factor;
+	double		result;
+	char	   *after_num;
+
+	errno = 0;
+	result = strtod(src, &after_num);
+	if (src == after_num)
+	{
+		fprintf(stderr,
+				_("%s: transfer rate \"%s\" is not a valid value\n"),
+				progname, src);
+		exit(1);
+	}
+	if (errno != 0)
+	{
+		fprintf(stderr,
+				_("%s: invalid transfer rate \"%s\": %s\n"),
+				progname, src, strerror(errno));
+		exit(1);
+	}
+
+	if (result <= 0)
+	{
+		/*
+		 * Reject obviously wrong values here. Exact check of the range to be
+		 * done on server.
+		 */
+		fprintf(stderr, _("%s: transfer rate must be greater than zero\n"),
+				progname);
+		exit(1);
+	}
+
+	/*
+	 * Evaluate (optional) suffix after skipping over possible whitespace.
+	 */
+	factor = 1.0;
+	while (*after_num != '\0' && isspace(*after_num))
+		after_num++;
+	switch (*after_num)
+	{
+		case 'M':
+			factor = 1048576.0;
+			after_num++;
+			break;
+		case 'k':
+			factor = 1024.0;
+			after_num++;
+			break;
+	}
+
+	/* The rest can only consist of white space. */
+	while (*after_num != '\0')
+	{
+		if (!isspace(*after_num))
+		{
+			fprintf(stderr,
+					_("%s: invalid --max-rate units: \"%s\"\n"),
+					progname, after_num);
+			exit(1);
+		}
+		after_num++;
+	}
+
+	if (factor > 1)
+		result *= factor;
+
+	/* Check the integer range */
+	if ((uint64) result != (uint64) ((uint32) result))
+	{
+		fprintf(stderr,
+				_("%s: transfer rate \"%s\" exceeds integer range\n"),
+				progname, src);
+		exit(1);
+	}
+
+	return (uint32) result;
+}
 
 /*
  * Write a piece of tar data
@@ -1308,8 +1391,9 @@ BaseBackup(void)
 	char	   *sysidentifier;
 	uint32		latesttli;
 	uint32		starttli;
-	char		current_path[MAXPGPATH];
+	char	   *basebkp;
 	char		escaped_label[MAXPGPATH];
+	char	   *maxrate_clause = NULL;
 	int			i;
 	char		xlogstart[64];
 	char		xlogend[64];
@@ -1382,15 +1466,20 @@ BaseBackup(void)
 	 * Start the actual backup
 	 */
 	PQescapeStringConn(conn, escaped_label, label, sizeof(escaped_label), &i);
-	snprintf(current_path, sizeof(current_path),
-			 "BASE_BACKUP LABEL '%s' %s %s %s %s",
-			 escaped_label,
-			 showprogress ? "PROGRESS" : "",
-			 includewal && !streamwal ? "WAL" : "",
-			 fastcheckpoint ? "FAST" : "",
-			 includewal ? "NOWAIT" : "");
 
-	if (PQsendQuery(conn, current_path) == 0)
+	if (maxrate > 0)
+		maxrate_clause = psprintf("MAX_RATE %u", maxrate);
+
+	basebkp =
+		psprintf("BASE_BACKUP LABEL '%s' %s %s %s %s %s",
+				 escaped_label,
+				 showprogress ? "PROGRESS" : "",
+				 includewal && !streamwal ? "WAL" : "",
+				 fastcheckpoint ? "FAST" : "",
+				 includewal ? "NOWAIT" : "",
+				 maxrate_clause ? maxrate_clause : "");
+
+	if (PQsendQuery(conn, basebkp) == 0)
 	{
 		fprintf(stderr, _("%s: could not send replication command \"%s\": %s"),
 				progname, "BASE_BACKUP", PQerrorMessage(conn));
@@ -1657,6 +1746,7 @@ main(int argc, char **argv)
 		{"pgdata", required_argument, NULL, 'D'},
 		{"format", required_argument, NULL, 'F'},
 		{"checkpoint", required_argument, NULL, 'c'},
+		{"max-rate", required_argument, NULL, 'r'},
 		{"write-recovery-conf", no_argument, NULL, 'R'},
 		{"xlog", no_argument, NULL, 'x'},
 		{"xlog-method", required_argument, NULL, 'X'},
@@ -1697,7 +1787,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "D:F:RxX:l:zZ:d:c:h:p:U:s:wWvP",
+	while ((c = getopt_long(argc, argv, "D:F:r:RxX:l:zZ:d:c:h:p:U:s:wWvP",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -1717,6 +1807,9 @@ main(int argc, char **argv)
 							progname, optarg);
 					exit(1);
 				}
+				break;
+			case 'r':
+				maxrate = parse_max_rate(optarg);
 				break;
 			case 'R':
 				writerecoveryconf = true;

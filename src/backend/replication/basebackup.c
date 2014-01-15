@@ -30,9 +30,11 @@
 #include "replication/walsender_private.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/ps_status.h"
+#include "utils/timestamp.h"
 #include "pgtar.h"
 
 typedef struct
@@ -42,6 +44,7 @@ typedef struct
 	bool		fastcheckpoint;
 	bool		nowait;
 	bool		includewal;
+	uint32		maxrate;
 } basebackup_options;
 
 
@@ -59,6 +62,7 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir);
 static void parse_basebackup_options(List *options, basebackup_options *opt);
 static void SendXlogRecPtrResult(XLogRecPtr ptr, TimeLineID tli);
 static int	compareWalFileNames(const void *a, const void *b);
+static void throttle(size_t increment);
 
 /* Was the backup currently in-progress initiated in recovery mode? */
 static bool backup_started_in_recovery = false;
@@ -67,6 +71,44 @@ static bool backup_started_in_recovery = false;
  * Size of each block sent into the tar stream for larger files.
  */
 #define TAR_SEND_SIZE 32768
+
+
+/*
+ * The maximum amount of data per second - bounds of the user input.
+ *
+ * If the maximum should be increased to more than 4 GB, uint64 must
+ * be introduced for the related variables. However such high values have
+ * little to do with throttling.
+ */
+#define MAX_RATE_LOWER	32768
+#define MAX_RATE_UPPER	(1024 << 20)
+
+/*
+ * Transfer rate is only measured when this number of bytes has been sent.
+ * (Too frequent checks would impose too high CPU overhead.)
+ *
+ * The default value is used unless it'd result in too frequent checks.
+ */
+#define THROTTLING_SAMPLE_MIN	32768
+
+/*
+ * How frequently to throttle, as a fraction of the specified rate-second.
+ */
+#define THROTTLING_MAX_FREQUENCY	8
+
+/* The actual value, transfer of which may cause sleep. */
+static uint32 throttling_sample;
+
+/* Amount of data already transfered but not yet throttled.  */
+static int32 throttling_counter;
+
+/* The minimum time required to transfer throttling_sample bytes. */
+static int64 elapsed_min_unit;
+
+/* The last check of the transfer rate. */
+static int64 throttled_last;
+
+static Latch throttling_latch;
 
 typedef struct
 {
@@ -186,6 +228,36 @@ perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 
 		/* Send tablespace header */
 		SendBackupHeader(tablespaces);
+
+		/* Setup and activate network throttling, if client requested it */
+		if (opt->maxrate > 0)
+		{
+			throttling_sample = opt->maxrate / THROTTLING_MAX_FREQUENCY;
+
+			/* Don't measure too small pieces of data. */
+			if (throttling_sample < THROTTLING_SAMPLE_MIN)
+				throttling_sample = THROTTLING_SAMPLE_MIN;
+
+			/*
+			 * opt->maxrate is bytes per second. Thus the expression in
+			 * brackets is microseconds per byte.
+			 */
+			elapsed_min_unit = throttling_sample *
+				((double) USECS_PER_SEC / opt->maxrate);
+
+			/* Enable throttling. */
+			throttling_counter = 0;
+
+			/* The 'real data' starts now (header was ignored). */
+			throttled_last = GetCurrentIntegerTimestamp();
+
+			InitLatch(&throttling_latch);
+		}
+		else
+		{
+			/* Disable throttling. */
+			throttling_counter = -1;
+		}
 
 		/* Send off our tablespaces one by one */
 		foreach(lc, tablespaces)
@@ -414,6 +486,8 @@ perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 							(errmsg("base backup could not send data, aborting backup")));
 
 				len += cnt;
+				throttle(cnt);
+
 				if (len == XLogSegSize)
 					break;
 			}
@@ -484,6 +558,7 @@ parse_basebackup_options(List *options, basebackup_options *opt)
 	bool		o_fast = false;
 	bool		o_nowait = false;
 	bool		o_wal = false;
+	bool		o_maxrate = false;
 
 	MemSet(opt, 0, sizeof(*opt));
 	foreach(lopt, options)
@@ -534,6 +609,29 @@ parse_basebackup_options(List *options, basebackup_options *opt)
 						 errmsg("duplicate option \"%s\"", defel->defname)));
 			opt->includewal = true;
 			o_wal = true;
+		}
+		else if (strcmp(defel->defname, "maxrate") == 0)
+		{
+			long		maxrate;
+
+			if (o_maxrate)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("duplicate option \"%s\"", defel->defname)));
+			maxrate = intVal(defel->arg);
+
+			opt->maxrate = (uint32) maxrate;
+			if (opt->maxrate > 0 &&
+			(opt->maxrate < MAX_RATE_LOWER || opt->maxrate > MAX_RATE_UPPER))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				  errmsg("transfer rate %u bytes per second is out of range",
+						 opt->maxrate),
+				 errhint("The accepted range is %u through %u kB per second",
+						 MAX_RATE_LOWER >> 10, MAX_RATE_UPPER >> 10)));
+			}
+			o_maxrate = true;
 		}
 		else
 			elog(ERROR, "option \"%s\" not recognized",
@@ -1071,6 +1169,7 @@ sendFile(char *readfilename, char *tarfilename, struct stat * statbuf,
 			   (errmsg("base backup could not send data, aborting backup")));
 
 		len += cnt;
+		throttle(cnt);
 
 		if (len >= statbuf->st_size)
 		{
@@ -1092,10 +1191,14 @@ sendFile(char *readfilename, char *tarfilename, struct stat * statbuf,
 			cnt = Min(sizeof(buf), statbuf->st_size - len);
 			pq_putmessage('d', buf, cnt);
 			len += cnt;
+			throttle(cnt);
 		}
 	}
 
-	/* Pad to 512 byte boundary, per tar format requirements */
+	/*
+	 * Pad to 512 byte boundary, per tar format requirements. (This small
+	 * piece of data is probably not worth throttling.)
+	 */
 	pad = ((len + 511) & ~511) - len;
 	if (pad > 0)
 	{
@@ -1120,4 +1223,57 @@ _tarWriteHeader(const char *filename, const char *linktarget,
 					statbuf->st_mtime);
 
 	pq_putmessage('d', h, 512);
+}
+
+/*
+ * Increment the network transfer counter by the given number of bytes,
+ * and sleep if necessary to comply with the requested network transfer
+ * rate.
+ */
+static void
+throttle(size_t increment)
+{
+	int64		elapsed,
+				elapsed_min,
+				sleep;
+
+	if (throttling_counter < 0)
+		return;
+
+	throttling_counter += increment;
+	if (throttling_counter < throttling_sample)
+		return;
+
+	/* Time elapsed since the last measuring (and possible wake up). */
+	elapsed = GetCurrentIntegerTimestamp() - throttled_last;
+	/* How much should have elapsed at minimum? */
+	elapsed_min = elapsed_min_unit * (throttling_counter / throttling_sample);
+	sleep = elapsed_min - elapsed;
+	/* Only sleep if the transfer is faster than it should be. */
+	if (sleep > 0)
+	{
+		ResetLatch(&throttling_latch);
+		/*
+		 * THROTTLING_SAMPLE_MIN / MAX_RATE_LOWER (in seconds) should be the
+		 * longest possible time to sleep. Thus the cast to long is safe.
+		 */
+		WaitLatch(&throttling_latch, WL_TIMEOUT | WL_POSTMASTER_DEATH,
+				  (long) (sleep / 1000));
+	}
+	else
+	{
+		/*
+		 * The actual transfer rate is below the limit.  Negative value would
+		 * distort the adjustment of throttled_last.
+		 */
+		sleep = 0;
+	}
+
+	/*
+	 * Only a whole multiple of throttling_sample was processed.  The rest will
+	 * be done during the next call of this function.
+	 */
+	throttling_counter %= throttling_sample;
+	/* Once the (possible) sleep ends, new period starts. */
+	throttled_last += elapsed + sleep;
 }
