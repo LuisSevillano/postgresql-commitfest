@@ -67,7 +67,7 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 	TimeLineID	restartTli;
 
 	/* In standby mode, restore_command might not be supplied */
-	if (recoveryRestoreCommand == NULL)
+	if (restore_command == NULL)
 		goto not_available;
 
 	/*
@@ -150,7 +150,7 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 	endp = xlogRestoreCmd + MAXPGPATH - 1;
 	*endp = '\0';
 
-	for (sp = recoveryRestoreCommand; *sp; sp++)
+	for (sp = restore_command; *sp; sp++)
 	{
 		if (*sp == '%')
 		{

@@ -892,7 +892,7 @@ do_stop(void)
 		/*
 		 * If backup_label exists, an online backup is running. Warn the user
 		 * that smart shutdown will wait for it to finish. However, if
-		 * recovery.conf is also present, we're recovering from an online
+		 * standby.enabled is also present, we're recovering from an online
 		 * backup instead of performing one.
 		 */
 		if (shutdown_mode == SMART_MODE &&
@@ -980,7 +980,7 @@ do_restart(void)
 		/*
 		 * If backup_label exists, an online backup is running. Warn the user
 		 * that smart shutdown will wait for it to finish. However, if
-		 * recovery.conf is also present, we're recovering from an online
+		 * standby.enabled is also present, we're recovering from an online
 		 * backup instead of performing one.
 		 */
 		if (shutdown_mode == SMART_MODE &&
@@ -1091,7 +1091,7 @@ do_promote(void)
 		exit(1);
 	}
 
-	/* If recovery.conf doesn't exist, the server is not in standby mode */
+	/* If standby.enabled doesn't exist, the server is not in standby mode */
 	if (stat(recovery_file, &statbuf) != 0)
 	{
 		write_stderr(_("%s: cannot promote server; "
@@ -2231,7 +2231,7 @@ main(int argc, char **argv)
 		snprintf(postopts_file, MAXPGPATH, "%s/postmaster.opts", pg_data);
 		snprintf(pid_file, MAXPGPATH, "%s/postmaster.pid", pg_data);
 		snprintf(backup_file, MAXPGPATH, "%s/backup_label", pg_data);
-		snprintf(recovery_file, MAXPGPATH, "%s/recovery.conf", pg_data);
+		snprintf(recovery_file, MAXPGPATH, "%s/standby.enabled", pg_data);
 	}
 
 	switch (ctl_command)

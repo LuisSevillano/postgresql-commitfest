@@ -5,8 +5,8 @@ Typical markup:
 
 &<>                             use & escapes
 PostgreSQL                      <productname>
-postgresql.conf, pg_hba.conf,
-        recovery.conf           <filename>
+postgresql.conf, pg_hba.conf
+        standby.enabled         <filename>
 [A-Z][A-Z_ ]+[A-Z_]             <command>, <literal>, <envar>, <acronym>
 [A-Za-z_][A-Za-z0-9_]+()        <function>
 -[-A-Za-z_]+                    <option>

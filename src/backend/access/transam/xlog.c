@@ -64,11 +64,12 @@
 extern uint32 bootstrap_data_checksum_version;
 
 /* File path names (all relative to $PGDATA) */
-#define RECOVERY_COMMAND_FILE	"recovery.conf"
-#define RECOVERY_COMMAND_DONE	"recovery.done"
+#define RECOVERY_ENABLE_FILE	"standby.enabled"
 #define PROMOTE_SIGNAL_FILE		"promote"
 #define FALLBACK_PROMOTE_SIGNAL_FILE "fallback_promote"
 
+/* recovery.conf is not supported anymore */
+#define RECOVERY_COMMAND_FILE	"recovery.conf"
 
 /* User-settable parameters */
 int			CheckPointSegments = 3;
@@ -85,7 +86,26 @@ int			sync_method = DEFAULT_SYNC_METHOD;
 int			wal_level = WAL_LEVEL_MINIMAL;
 int			CommitDelay = 0;	/* precommit delay in microseconds */
 int			CommitSiblings = 5; /* # concurrent xacts needed to sleep */
+char	   *restore_command = NULL;
+char	   *archive_cleanup_command = NULL;
+char	   *recovery_end_command = NULL;
+bool		StandbyModeRequested = false;
+char	   *primary_conninfo = NULL;
+char	   *trigger_file = NULL;
+RecoveryTargetType	recovery_target = RECOVERY_TARGET_UNSET;
+TransactionId		recovery_target_xid = InvalidTransactionId;
+TimestampTz			recovery_target_time = 0;
+char	   *recovery_target_name = NULL;
+bool		recovery_target_inclusive = true;
+bool		pause_at_recovery_target = true;
+char	   *recovery_target_timeline_string = NULL;
+TimeLineID	recovery_target_timeline = 0;
 int			num_xloginsert_slots = 8;
+int 		min_recovery_apply_delay = 0;
+static TimestampTz recoveryDelayUntilTime;
+
+/* are we currently in standby mode? */
+bool StandbyMode = false;
 
 #ifdef WAL_DEBUG
 bool		XLOG_DEBUG = false;
@@ -194,7 +214,7 @@ static int	LocalXLogInsertAllowed = -1;
 
 /*
  * When ArchiveRecoveryRequested is set, archive recovery was requested,
- * ie. recovery.conf file was present. When InArchiveRecovery is set, we are
+ * ie. standby.enabled file was present. When InArchiveRecovery is set, we are
  * currently recovering using offline XLOG archives. These variables are only
  * valid in the startup process.
  *
@@ -208,27 +228,6 @@ bool		InArchiveRecovery = false;
 
 /* Was the last xlog file restored from archive, or local? */
 static bool restoredFromArchive = false;
-
-/* options taken from recovery.conf for archive recovery */
-char	   *recoveryRestoreCommand = NULL;
-static char *recoveryEndCommand = NULL;
-static char *archiveCleanupCommand = NULL;
-static RecoveryTargetType recoveryTarget = RECOVERY_TARGET_UNSET;
-static bool recoveryTargetInclusive = true;
-static bool recoveryPauseAtTarget = true;
-static TransactionId recoveryTargetXid;
-static TimestampTz recoveryTargetTime;
-static char *recoveryTargetName;
-static int min_recovery_apply_delay = 0;
-static TimestampTz recoveryDelayUntilTime;
-
-/* options taken from recovery.conf for XLOG streaming */
-static bool StandbyModeRequested = false;
-static char *PrimaryConnInfo = NULL;
-static char *TriggerFile = NULL;
-
-/* are we currently in standby mode? */
-bool		StandbyMode = false;
 
 /* whether request for fast promotion has been made yet */
 static bool fast_promote = false;
@@ -531,12 +530,6 @@ typedef struct XLogCtlData
 	TimeLineID	PrevTimeLineID;
 
 	/*
-	 * archiveCleanupCommand is read from recovery.conf but needs to be in
-	 * shared memory so that the checkpointer process can access it.
-	 */
-	char		archiveCleanupCommand[MAXPGPATH];
-
-	/*
 	 * SharedRecoveryInProgress indicates if we're still in crash or archive
 	 * recovery.  Protected by info_lck.
 	 */
@@ -732,7 +725,7 @@ static bool bgwriterLaunched = false;
 static int	MySlotNo = 0;
 static bool holdingAllSlots = false;
 
-static void readRecoveryCommandFile(void);
+static void CheckStartingAsStandby(void);
 static void exitArchiveRecovery(TimeLineID endTLI, XLogSegNo endLogSegNo);
 static bool recoveryStopsBefore(XLogRecord *record);
 static bool recoveryStopsAfter(XLogRecord *record);
@@ -5308,187 +5301,27 @@ str_time(pg_time_t tnow)
  * The file is parsed using the main configuration parser.
  */
 static void
-readRecoveryCommandFile(void)
+CheckStartingAsStandby(void)
 {
 	FILE	   *fd;
-	TimeLineID	rtli = 0;
-	bool		rtliGiven = false;
-	ConfigVariable *item,
-			   *head = NULL,
-			   *tail = NULL;
 
-	fd = AllocateFile(RECOVERY_COMMAND_FILE, "r");
+	/* Check the presence of recovery.conf, it is not supported anymore */
+	if (AllocateFile(RECOVERY_COMMAND_FILE, "r") != NULL)
+		ereport(FATAL,
+				(errmsg("\"%s\" is not supported anymore as a recovery method",
+						RECOVERY_COMMAND_FILE),
+				 errdetail("Refer to appropriate documentation about migration methods")));
+
+	/* Check the presence of file standby.enabled, the file triggering recovery */
+	fd = AllocateFile(RECOVERY_ENABLE_FILE, "r");
 	if (fd == NULL)
 	{
 		if (errno == ENOENT)
 			return;				/* not there, so no archive recovery */
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not open recovery command file \"%s\": %m",
-						RECOVERY_COMMAND_FILE)));
-	}
-
-	/*
-	 * Since we're asking ParseConfigFp() to report errors as FATAL, there's
-	 * no need to check the return value.
-	 */
-	(void) ParseConfigFp(fd, RECOVERY_COMMAND_FILE, 0, FATAL, &head, &tail);
-
-	FreeFile(fd);
-
-	for (item = head; item; item = item->next)
-	{
-		if (strcmp(item->name, "restore_command") == 0)
-		{
-			recoveryRestoreCommand = pstrdup(item->value);
-			ereport(DEBUG2,
-					(errmsg_internal("restore_command = '%s'",
-									 recoveryRestoreCommand)));
-		}
-		else if (strcmp(item->name, "recovery_end_command") == 0)
-		{
-			recoveryEndCommand = pstrdup(item->value);
-			ereport(DEBUG2,
-					(errmsg_internal("recovery_end_command = '%s'",
-									 recoveryEndCommand)));
-		}
-		else if (strcmp(item->name, "archive_cleanup_command") == 0)
-		{
-			archiveCleanupCommand = pstrdup(item->value);
-			ereport(DEBUG2,
-					(errmsg_internal("archive_cleanup_command = '%s'",
-									 archiveCleanupCommand)));
-		}
-		else if (strcmp(item->name, "pause_at_recovery_target") == 0)
-		{
-			if (!parse_bool(item->value, &recoveryPauseAtTarget))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("parameter \"%s\" requires a Boolean value", "pause_at_recovery_target")));
-			ereport(DEBUG2,
-					(errmsg_internal("pause_at_recovery_target = '%s'",
-									 item->value)));
-		}
-		else if (strcmp(item->name, "recovery_target_timeline") == 0)
-		{
-			rtliGiven = true;
-			if (strcmp(item->value, "latest") == 0)
-				rtli = 0;
-			else
-			{
-				errno = 0;
-				rtli = (TimeLineID) strtoul(item->value, NULL, 0);
-				if (errno == EINVAL || errno == ERANGE)
-					ereport(FATAL,
-							(errmsg("recovery_target_timeline is not a valid number: \"%s\"",
-									item->value)));
-			}
-			if (rtli)
-				ereport(DEBUG2,
-				   (errmsg_internal("recovery_target_timeline = %u", rtli)));
-			else
-				ereport(DEBUG2,
-					 (errmsg_internal("recovery_target_timeline = latest")));
-		}
-		else if (strcmp(item->name, "recovery_target_xid") == 0)
-		{
-			errno = 0;
-			recoveryTargetXid = (TransactionId) strtoul(item->value, NULL, 0);
-			if (errno == EINVAL || errno == ERANGE)
-				ereport(FATAL,
-				 (errmsg("recovery_target_xid is not a valid number: \"%s\"",
-						 item->value)));
-			ereport(DEBUG2,
-					(errmsg_internal("recovery_target_xid = %u",
-									 recoveryTargetXid)));
-			recoveryTarget = RECOVERY_TARGET_XID;
-		}
-		else if (strcmp(item->name, "recovery_target_time") == 0)
-		{
-			recoveryTarget = RECOVERY_TARGET_TIME;
-
-			/*
-			 * Convert the time string given by the user to TimestampTz form.
-			 */
-			recoveryTargetTime =
-				DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
-												CStringGetDatum(item->value),
-												ObjectIdGetDatum(InvalidOid),
-														Int32GetDatum(-1)));
-			ereport(DEBUG2,
-					(errmsg_internal("recovery_target_time = '%s'",
-								   timestamptz_to_str(recoveryTargetTime))));
-		}
-		else if (strcmp(item->name, "recovery_target_name") == 0)
-		{
-			recoveryTarget = RECOVERY_TARGET_NAME;
-
-			recoveryTargetName = pstrdup(item->value);
-			if (strlen(recoveryTargetName) >= MAXFNAMELEN)
-				ereport(FATAL,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("recovery_target_name is too long (maximum %d characters)",
-								MAXFNAMELEN - 1)));
-
-			ereport(DEBUG2,
-					(errmsg_internal("recovery_target_name = '%s'",
-									 recoveryTargetName)));
-		}
-		else if (strcmp(item->name, "recovery_target_inclusive") == 0)
-		{
-			/*
-			 * does nothing if a recovery_target is not also set
-			 */
-			if (!parse_bool(item->value, &recoveryTargetInclusive))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("parameter \"%s\" requires a Boolean value",
-								"recovery_target_inclusive")));
-			ereport(DEBUG2,
-					(errmsg_internal("recovery_target_inclusive = %s",
-									 item->value)));
-		}
-		else if (strcmp(item->name, "standby_mode") == 0)
-		{
-			if (!parse_bool(item->value, &StandbyModeRequested))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("parameter \"%s\" requires a Boolean value",
-								"standby_mode")));
-			ereport(DEBUG2,
-					(errmsg_internal("standby_mode = '%s'", item->value)));
-		}
-		else if (strcmp(item->name, "primary_conninfo") == 0)
-		{
-			PrimaryConnInfo = pstrdup(item->value);
-			ereport(DEBUG2,
-					(errmsg_internal("primary_conninfo = '%s'",
-									 PrimaryConnInfo)));
-		}
-		else if (strcmp(item->name, "trigger_file") == 0)
-		{
-			TriggerFile = pstrdup(item->value);
-			ereport(DEBUG2,
-					(errmsg_internal("trigger_file = '%s'",
-									 TriggerFile)));
-		}
-		else if (strcmp(item->name, "min_recovery_apply_delay") == 0)
-		{
-			const char *hintmsg;
-
-			if (!parse_int(item->value, &min_recovery_apply_delay, GUC_UNIT_MS,
-					&hintmsg))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("parameter \"%s\" requires a temporal value", "min_recovery_apply_delay"),
-						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
-			ereport(DEBUG2,
-					(errmsg("min_recovery_apply_delay = '%s'", item->value)));
-		}
-		else
-			ereport(FATAL,
-					(errmsg("unrecognized recovery parameter \"%s\"",
-							item->name)));
+				 errmsg("could not open recovery file trigger \"%s\": %m",
+						RECOVERY_ENABLE_FILE)));
 	}
 
 	/*
@@ -5496,18 +5329,16 @@ readRecoveryCommandFile(void)
 	 */
 	if (StandbyModeRequested)
 	{
-		if (PrimaryConnInfo == NULL && recoveryRestoreCommand == NULL)
+		if (primary_conninfo == NULL && restore_command == NULL)
 			ereport(WARNING,
-					(errmsg("recovery command file \"%s\" specified neither primary_conninfo nor restore_command",
-							RECOVERY_COMMAND_FILE),
+					(errmsg("Neither primary_conninfo nor restore_command specified"),
 					 errhint("The database server will regularly poll the pg_xlog subdirectory to check for files placed there.")));
 	}
 	else
 	{
-		if (recoveryRestoreCommand == NULL)
+		if (restore_command == NULL)
 			ereport(FATAL,
-					(errmsg("recovery command file \"%s\" must specify restore_command when standby mode is not enabled",
-							RECOVERY_COMMAND_FILE)));
+					(errmsg("restore_command must be specified when standby_mode is not enabled")));
 	}
 
 	/* Enable fetching from archive recovery area */
@@ -5519,16 +5350,17 @@ readRecoveryCommandFile(void)
 	 * command and set InArchiveRecovery, because we need to fetch timeline
 	 * history files from the archive.
 	 */
-	if (rtliGiven)
+	if (strcmp(recovery_target_timeline_string, "") != 0)
 	{
-		if (rtli)
+		if (recovery_target_timeline)
 		{
 			/* Timeline 1 does not have a history file, all else should */
-			if (rtli != 1 && !existsTimeLineHistory(rtli))
+			if (recovery_target_timeline != 1 && 
+				!existsTimeLineHistory(recovery_target_timeline))
 				ereport(FATAL,
 						(errmsg("recovery target timeline %u does not exist",
-								rtli)));
-			recoveryTargetTLI = rtli;
+								recovery_target_timeline)));
+			recoveryTargetTLI = recovery_target_timeline;
 			recoveryTargetIsLatest = false;
 		}
 		else
@@ -5538,8 +5370,6 @@ readRecoveryCommandFile(void)
 			recoveryTargetIsLatest = true;
 		}
 	}
-
-	FreeConfigVariables(head);
 }
 
 /*
@@ -5610,15 +5440,13 @@ exitArchiveRecovery(TimeLineID endTLI, XLogSegNo endLogSegNo)
 	unlink(recoveryPath);		/* ignore any error */
 
 	/*
-	 * Rename the config file out of the way, so that we don't accidentally
-	 * re-enter archive recovery mode in a subsequent crash.
+	 * Remove file that triggered the recovery
 	 */
-	unlink(RECOVERY_COMMAND_DONE);
-	if (rename(RECOVERY_COMMAND_FILE, RECOVERY_COMMAND_DONE) != 0)
+	if (unlink(RECOVERY_ENABLE_FILE) != 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not rename file \"%s\" to \"%s\": %m",
-						RECOVERY_COMMAND_FILE, RECOVERY_COMMAND_DONE)));
+				 errmsg("could not remove file \"%s\": %m",
+						RECOVERY_ENABLE_FILE)));
 
 	ereport(LOG,
 			(errmsg("archive recovery complete")));
@@ -5687,7 +5515,7 @@ recoveryStopsBefore(XLogRecord *record)
 	else
 		return false;
 
-	if (recoveryTarget == RECOVERY_TARGET_XID && !recoveryTargetInclusive)
+	if (recovery_target == RECOVERY_TARGET_XID && !recovery_target_inclusive)
 	{
 		/*
 		 * There can be only one transaction end record with this exact
@@ -5698,10 +5526,10 @@ recoveryStopsBefore(XLogRecord *record)
 		 * they complete. A higher numbered xid will complete before you
 		 * about 50% of the time...
 		 */
-		stopsHere = (record->xl_xid == recoveryTargetXid);
+		stopsHere = (record->xl_xid == recovery_target_xid);
 	}
 
-	if (recoveryTarget == RECOVERY_TARGET_TIME &&
+	if (recovery_target == RECOVERY_TARGET_TIME &&
 		getRecordTimestamp(record, &recordXtime))
 	{
 		/*
@@ -5709,10 +5537,10 @@ recoveryStopsBefore(XLogRecord *record)
 		 * we stop after the last one, if we are inclusive, or stop at the
 		 * first one if we are exclusive
 		 */
-		if (recoveryTargetInclusive)
-			stopsHere = (recordXtime > recoveryTargetTime);
+		if (recovery_target_inclusive)
+			stopsHere = (recordXtime > recovery_target_time);
 		else
-			stopsHere = (recordXtime >= recoveryTargetTime);
+			stopsHere = (recordXtime >= recovery_target_time);
 	}
 
 	if (stopsHere)
@@ -5759,14 +5587,14 @@ recoveryStopsAfter(XLogRecord *record)
 	 * There can be many restore points that share the same name; we stop
 	 * at the first one.
 	 */
-	if (recoveryTarget == RECOVERY_TARGET_NAME &&
+	if (recovery_target == RECOVERY_TARGET_NAME &&
 		record->xl_rmid == RM_XLOG_ID && record_info == XLOG_RESTORE_POINT)
 	{
 		xl_restore_point *recordRestorePointData;
 
 		recordRestorePointData = (xl_restore_point *) XLogRecGetData(record);
 
-		if (strcmp(recordRestorePointData->rp_name, recoveryTargetName) == 0)
+		if (strcmp(recordRestorePointData->rp_name, recovery_target_name) == 0)
 		{
 			recoveryStopAfter = true;
 			recoveryStopXid = InvalidTransactionId;
@@ -5799,8 +5627,8 @@ recoveryStopsAfter(XLogRecord *record)
 		 * they complete. A higher numbered xid will complete before you about
 		 * 50% of the time...
 		 */
-		if (recoveryTarget == RECOVERY_TARGET_XID && recoveryTargetInclusive &&
-			record->xl_xid == recoveryTargetXid)
+		if (recovery_target == RECOVERY_TARGET_XID && recovery_target_inclusive &&
+			record->xl_xid == recovery_target_xid)
 		{
 			recoveryStopAfter = true;
 			recoveryStopXid = record->xl_xid;
@@ -6216,36 +6044,28 @@ StartupXLOG(void)
 		recoveryTargetTLI = ControlFile->checkPointCopy.ThisTimeLineID;
 
 	/*
-	 * Check for recovery control file, and if so set up state for offline
-	 * recovery
+	 * Check for recovery trigger file, and if so set up state for offline
+	 * recovery.
 	 */
-	readRecoveryCommandFile();
-
-	/*
-	 * Save archive_cleanup_command in shared memory so that other processes
-	 * can see it.
-	 */
-	strncpy(XLogCtl->archiveCleanupCommand,
-			archiveCleanupCommand ? archiveCleanupCommand : "",
-			sizeof(XLogCtl->archiveCleanupCommand));
+	CheckStartingAsStandby();
 
 	if (ArchiveRecoveryRequested)
 	{
 		if (StandbyModeRequested)
 			ereport(LOG,
 					(errmsg("entering standby mode")));
-		else if (recoveryTarget == RECOVERY_TARGET_XID)
+		else if (recovery_target == RECOVERY_TARGET_XID)
 			ereport(LOG,
 					(errmsg("starting point-in-time recovery to XID %u",
-							recoveryTargetXid)));
-		else if (recoveryTarget == RECOVERY_TARGET_TIME)
+							recovery_target_xid)));
+		else if (recovery_target == RECOVERY_TARGET_TIME)
 			ereport(LOG,
 					(errmsg("starting point-in-time recovery to %s",
-							timestamptz_to_str(recoveryTargetTime))));
-		else if (recoveryTarget == RECOVERY_TARGET_NAME)
+							timestamptz_to_str(recovery_target_time))));
+		else if (recovery_target == RECOVERY_TARGET_NAME)
 			ereport(LOG,
 					(errmsg("starting point-in-time recovery to \"%s\"",
-							recoveryTargetName)));
+							recovery_target_name)));
 		else
 			ereport(LOG,
 					(errmsg("starting archive recovery")));
@@ -6512,7 +6332,7 @@ StartupXLOG(void)
 
 	/*
 	 * Check whether we need to force recovery from WAL.  If it appears to
-	 * have been a clean shutdown and we did not have a recovery.conf file,
+	 * have been a clean shutdown and we did not have a standby.enabled file,
 	 * then assume no recovery needed.
 	 */
 	if (checkPoint.redo < RecPtr)
@@ -6526,7 +6346,7 @@ StartupXLOG(void)
 		InRecovery = true;
 	else if (ArchiveRecoveryRequested)
 	{
-		/* force recovery due to presence of recovery.conf */
+		/* force recovery due to presence of standby.enabled */
 		InRecovery = true;
 	}
 
@@ -6986,7 +6806,7 @@ StartupXLOG(void)
 			 * end of main redo apply loop
 			 */
 
-			if (recoveryPauseAtTarget && reachedStopPoint)
+			if (pause_at_recovery_target && reachedStopPoint)
 			{
 				SetRecoveryPause(true);
 				recoveryPausesHere();
@@ -7111,17 +6931,17 @@ StartupXLOG(void)
 		 * Create a comment for the history file to explain why and where
 		 * timeline changed.
 		 */
-		if (recoveryTarget == RECOVERY_TARGET_XID)
+		if (recovery_target == RECOVERY_TARGET_XID)
 			snprintf(reason, sizeof(reason),
 					 "%s transaction %u",
 					 recoveryStopAfter ? "after" : "before",
 					 recoveryStopXid);
-		else if (recoveryTarget == RECOVERY_TARGET_TIME)
+		else if (recovery_target == RECOVERY_TARGET_TIME)
 			snprintf(reason, sizeof(reason),
 					 "%s %s\n",
 					 recoveryStopAfter ? "after" : "before",
 					 timestamptz_to_str(recoveryStopTime));
-		else if (recoveryTarget == RECOVERY_TARGET_NAME)
+		else if (recovery_target == RECOVERY_TARGET_NAME)
 			snprintf(reason, sizeof(reason),
 					 "at restore point \"%s\"",
 					 recoveryStopName);
@@ -7292,8 +7112,8 @@ StartupXLOG(void)
 		/*
 		 * And finally, execute the recovery_end_command, if any.
 		 */
-		if (recoveryEndCommand)
-			ExecuteRecoveryCommand(recoveryEndCommand,
+		if (recovery_end_command)
+			ExecuteRecoveryCommand(recovery_end_command,
 								   "recovery_end_command",
 								   true);
 	}
@@ -8884,8 +8704,8 @@ CreateRestartPoint(int flags)
 	/*
 	 * Finally, execute archive_cleanup_command, if any.
 	 */
-	if (XLogCtl->archiveCleanupCommand[0])
-		ExecuteRecoveryCommand(XLogCtl->archiveCleanupCommand,
+	if (archive_cleanup_command)
+		ExecuteRecoveryCommand(archive_cleanup_command,
 							   "archive_cleanup_command",
 							   false);
 
@@ -10961,7 +10781,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 					 * that when we later jump backwards to start redo at
 					 * RedoStartLSN, we will have the logs streamed already.
 					 */
-					if (PrimaryConnInfo)
+					if (primary_conninfo)
 					{
 						XLogRecPtr	ptr;
 						TimeLineID	tli;
@@ -10982,7 +10802,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 									 tli, curFileTLI);
 						}
 						curFileTLI = tli;
-						RequestXLogStreaming(tli, ptr, PrimaryConnInfo);
+						RequestXLogStreaming(tli, ptr, primary_conninfo);
 						receivedUpto = 0;
 					}
 
@@ -11297,14 +11117,14 @@ CheckForStandbyTrigger(void)
 		return true;
 	}
 
-	if (TriggerFile == NULL)
+	if (trigger_file == NULL)
 		return false;
 
-	if (stat(TriggerFile, &stat_buf) == 0)
+	if (stat(trigger_file, &stat_buf) == 0)
 	{
 		ereport(LOG,
-				(errmsg("trigger file found: %s", TriggerFile)));
-		unlink(TriggerFile);
+				(errmsg("trigger file found: %s", trigger_file)));
+		unlink(trigger_file);
 		triggered = true;
 		fast_promote = true;
 		return true;
