@@ -176,6 +176,8 @@ extern void recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 
 extern ObjectClass getObjectClass(const ObjectAddress *object);
 
+extern Oid get_class_catalog(ObjectClass oclass);
+
 extern ObjectAddresses *new_object_addresses(void);
 
 extern void add_exact_object_address(const ObjectAddress *object,

@@ -31,7 +31,8 @@
 static char *format_type_internal(Oid type_oid, int32 typemod,
 					 bool typemod_given, bool allow_invalid,
 					 bool force_qualify);
-static char *printTypmod(const char *typname, int32 typmod, Oid typmodout);
+static char *printTypmod(const char *typname, int32 typmod, Oid typmodout,
+						 bool typmodOnly);
 
 
 /*
@@ -96,6 +97,9 @@ format_type_be(Oid type_oid)
 	return format_type_internal(type_oid, -1, false, false, false);
 }
 
+/*
+ * This version returns a name which is always qualified.
+ */
 char *
 format_type_be_qualified(Oid type_oid)
 {
@@ -111,6 +115,153 @@ format_type_with_typemod(Oid type_oid, int32 typemod)
 	return format_type_internal(type_oid, typemod, true, false, false);
 }
 
+/*
+ * Formats a system type.
+ *
+ * These special cases should all correspond to special productions in gram.y,
+ * to ensure that the type name will be taken as a system type, not a user type
+ * of the same name.
+ *
+ * Returns NULL if not a system type.
+ */
+static char *
+format_special_type(Oid type_oid, Form_pg_type typeform,
+					int32 typemod, bool typemod_given, bool with_typemod)
+{
+	char   *buf = NULL;
+
+	switch (type_oid)
+	{
+		case BITOID:
+			if (with_typemod)
+				buf = printTypmod("bit", typemod, typeform->typmodout, false);
+			else if (typemod_given)
+			{
+				/*
+				 * bit with typmod -1 is not the same as BIT, which means
+				 * BIT(1) per SQL spec.  Report it as the quoted typename so
+				 * that parser will not assign a bogus typmod.
+				 */
+			}
+			else
+				buf = pstrdup("bit");
+			break;
+
+		case BOOLOID:
+			buf = pstrdup("boolean");
+			break;
+
+		case BPCHAROID:
+			if (with_typemod)
+				buf = printTypmod("character", typemod, typeform->typmodout,
+								  false);
+			else if (typemod_given)
+			{
+				/*
+				 * bpchar with typmod -1 is not the same as CHARACTER, which
+				 * means CHARACTER(1) per SQL spec.  Report it as bpchar so
+				 * that parser will not assign a bogus typmod.
+				 */
+			}
+			else
+				buf = pstrdup("character");
+			break;
+
+		case FLOAT4OID:
+			buf = pstrdup("real");
+			break;
+
+		case FLOAT8OID:
+			buf = pstrdup("double precision");
+			break;
+
+		case INT2OID:
+			buf = pstrdup("smallint");
+			break;
+
+		case INT4OID:
+			buf = pstrdup("integer");
+			break;
+
+		case INT8OID:
+			buf = pstrdup("bigint");
+			break;
+
+		case NUMERICOID:
+			if (with_typemod)
+				buf = printTypmod("numeric", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("numeric");
+			break;
+
+		case INTERVALOID:
+			if (with_typemod)
+				buf = printTypmod("interval", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("interval");
+			break;
+
+		case TIMEOID:
+			if (with_typemod)
+				buf = printTypmod("time", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("time without time zone");
+			break;
+
+		case TIMETZOID:
+			if (with_typemod)
+				buf = printTypmod("time", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("time with time zone");
+			break;
+
+		case TIMESTAMPOID:
+			if (with_typemod)
+				buf = printTypmod("timestamp", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("timestamp without time zone");
+			break;
+
+		case TIMESTAMPTZOID:
+			if (with_typemod)
+				buf = printTypmod("timestamp", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("timestamp with time zone");
+			break;
+
+		case VARBITOID:
+			if (with_typemod)
+				buf = printTypmod("bit varying", typemod, typeform->typmodout,
+								  false);
+			else
+				buf = pstrdup("bit varying");
+			break;
+
+		case VARCHAROID:
+			if (with_typemod)
+				buf = printTypmod("character varying", typemod,
+								  typeform->typmodout, false);
+			else
+				buf = pstrdup("character varying");
+			break;
+	}
+
+	return buf;
+}
+
+/*
+ * Return a formatted typename.
+ *
+ * If qualify is Auto, the type name is qualified if necessary, which means
+ * qualify when not visible to search_path.  If qualify is Always, it is
+ * qualified regardless of visibility.
+ */
 static char *
 format_type_internal(Oid type_oid, int32 typemod,
 					 bool typemod_given, bool allow_invalid,
@@ -167,9 +318,6 @@ format_type_internal(Oid type_oid, int32 typemod,
 
 	/*
 	 * See if we want to special-case the output for certain built-in types.
-	 * Note that these special cases should all correspond to special
-	 * productions in gram.y, to ensure that the type name will be taken as a
-	 * system type, not a user type of the same name.
 	 *
 	 * If we do not provide a special-case output here, the type name will be
 	 * handled the same way as a user type name --- in particular, it will be
@@ -178,118 +326,8 @@ format_type_internal(Oid type_oid, int32 typemod,
 	 */
 	buf = NULL;					/* flag for no special case */
 
-	switch (type_oid)
-	{
-		case BITOID:
-			if (with_typemod)
-				buf = printTypmod("bit", typemod, typeform->typmodout);
-			else if (typemod_given)
-			{
-				/*
-				 * bit with typmod -1 is not the same as BIT, which means
-				 * BIT(1) per SQL spec.  Report it as the quoted typename so
-				 * that parser will not assign a bogus typmod.
-				 */
-			}
-			else
-				buf = pstrdup("bit");
-			break;
-
-		case BOOLOID:
-			buf = pstrdup("boolean");
-			break;
-
-		case BPCHAROID:
-			if (with_typemod)
-				buf = printTypmod("character", typemod, typeform->typmodout);
-			else if (typemod_given)
-			{
-				/*
-				 * bpchar with typmod -1 is not the same as CHARACTER, which
-				 * means CHARACTER(1) per SQL spec.  Report it as bpchar so
-				 * that parser will not assign a bogus typmod.
-				 */
-			}
-			else
-				buf = pstrdup("character");
-			break;
-
-		case FLOAT4OID:
-			buf = pstrdup("real");
-			break;
-
-		case FLOAT8OID:
-			buf = pstrdup("double precision");
-			break;
-
-		case INT2OID:
-			buf = pstrdup("smallint");
-			break;
-
-		case INT4OID:
-			buf = pstrdup("integer");
-			break;
-
-		case INT8OID:
-			buf = pstrdup("bigint");
-			break;
-
-		case NUMERICOID:
-			if (with_typemod)
-				buf = printTypmod("numeric", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("numeric");
-			break;
-
-		case INTERVALOID:
-			if (with_typemod)
-				buf = printTypmod("interval", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("interval");
-			break;
-
-		case TIMEOID:
-			if (with_typemod)
-				buf = printTypmod("time", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("time without time zone");
-			break;
-
-		case TIMETZOID:
-			if (with_typemod)
-				buf = printTypmod("time", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("time with time zone");
-			break;
-
-		case TIMESTAMPOID:
-			if (with_typemod)
-				buf = printTypmod("timestamp", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("timestamp without time zone");
-			break;
-
-		case TIMESTAMPTZOID:
-			if (with_typemod)
-				buf = printTypmod("timestamp", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("timestamp with time zone");
-			break;
-
-		case VARBITOID:
-			if (with_typemod)
-				buf = printTypmod("bit varying", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("bit varying");
-			break;
-
-		case VARCHAROID:
-			if (with_typemod)
-				buf = printTypmod("character varying", typemod, typeform->typmodout);
-			else
-				buf = pstrdup("character varying");
-			break;
-	}
+	buf = format_special_type(type_oid, typeform,
+							  typemod, typemod_given, with_typemod);
 
 	if (buf == NULL)
 	{
@@ -312,7 +350,7 @@ format_type_internal(Oid type_oid, int32 typemod,
 		buf = quote_qualified_identifier(nspname, typname);
 
 		if (with_typemod)
-			buf = printTypmod(buf, typemod, typeform->typmodout);
+			buf = printTypmod(buf, typemod, typeform->typmodout, false);
 	}
 
 	if (is_array)
@@ -323,12 +361,113 @@ format_type_internal(Oid type_oid, int32 typemod,
 	return buf;
 }
 
+/*
+ * Similar to format_type_internal, except we return each bit of information
+ * separately:
+ *
+ * - is_system is set if the type corresponds to a special case in gram.y
+ *   (and therefore does not need any quoting or schema-qualification)
+ *
+ * - nspname is the schema name, without quotes.  This is NULL if the
+ *   type is a system type.
+ *
+ * - typename is set to the type name, without quotes
+ *
+ * - typmod is set to the typemod, if any, as a string with parens
+ *
+ * - is_array indicates whether []s must be added
+ *
+ * XXX there is a lot of code duplication between this routine and
+ * format_type_internal.  (One thing that doesn't quite match is the whole
+ * allow_invalid business.)
+ */
+void
+format_type_detailed(Oid type_oid, int32 typemod,
+					 bool *is_system,
+					 char **nspname, char **typname, char **typemodstr,
+					 bool *is_array)
+{
+	HeapTuple	tuple;
+	Form_pg_type typeform;
+	Oid			array_base_type;
+	char	   *buf;
+
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for type %u", type_oid);
+
+	typeform = (Form_pg_type) GETSTRUCT(tuple);
+
+	/*
+	 * Check if it's a regular (variable length) array type.  Fixed-length
+	 * array types such as "name" shouldn't get deconstructed.  As of Postgres
+	 * 8.1, rather than checking typlen we check the toast property, and don't
+	 * deconstruct "plain storage" array types --- this is because we don't
+	 * want to show oidvector as oid[].
+	 */
+	array_base_type = typeform->typelem;
+
+	if (array_base_type != InvalidOid &&
+		typeform->typstorage != 'p')
+	{
+		/* Switch our attention to the array element type */
+		ReleaseSysCache(tuple);
+		tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(array_base_type));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for type %u", type_oid);
+
+		typeform = (Form_pg_type) GETSTRUCT(tuple);
+		type_oid = array_base_type;
+		*is_array = true;
+	}
+	else
+		*is_array = false;
+
+	/*
+	 * See if we want to special-case the output for certain built-in types.
+	 *
+	 * If we do not provide a special-case output here, the type name must be
+	 * handled the same way as a user type name --- in particular, it must be
+	 * double-quoted if it matches any lexer keyword.  This behavior is
+	 * essential for some cases, such as types "bit" and "char".
+	 */
+	buf = format_special_type(type_oid, typeform,
+							  typemod, typemod >= 0, false);
+
+	if (buf != NULL)
+	{
+		*is_system = true;
+		*typname = buf;
+		*nspname = NULL;
+
+		if (typemod > 0)
+			*typemodstr = printTypmod(buf, typemod, typeform->typmodout, true);
+		else
+			*typemodstr = pstrdup("");	/* XXX ?? */
+	}
+	else
+	{
+		/* Default handling: report the name as it appears in the catalog. */
+		*is_system = false;
+
+		*nspname = get_namespace_name(typeform->typnamespace);
+		*typname = pstrdup(NameStr(typeform->typname));
+
+		if (typemod > 0)
+			*typemodstr = printTypmod(buf, typemod, typeform->typmodout, true);
+		else
+			*typemodstr = pstrdup("");	/* XXX ?? */
+	}
+
+	ReleaseSysCache(tuple);
+}
+
 
 /*
  * Add typmod decoration to the basic type name
  */
 static char *
-printTypmod(const char *typname, int32 typmod, Oid typmodout)
+printTypmod(const char *typname, int32 typmod, Oid typmodout, bool typmodOnly)
 {
 	char	   *res;
 
@@ -338,7 +477,10 @@ printTypmod(const char *typname, int32 typmod, Oid typmodout)
 	if (typmodout == InvalidOid)
 	{
 		/* Default behavior: just print the integer typmod with parens */
-		res = psprintf("%s(%d)", typname, (int) typmod);
+		if (typmodOnly)
+			res = psprintf("(%d)", (int) typmod);
+		else
+			res = psprintf("%s(%d)", typname, (int) typmod);
 	}
 	else
 	{
@@ -347,12 +489,14 @@ printTypmod(const char *typname, int32 typmod, Oid typmodout)
 
 		tmstr = DatumGetCString(OidFunctionCall1(typmodout,
 												 Int32GetDatum(typmod)));
-		res = psprintf("%s%s", typname, tmstr);
+		if (typmodOnly)
+			res = psprintf("%s", tmstr);
+		else
+			res = psprintf("%s%s", typname, tmstr);
 	}
 
 	return res;
 }
-
 
 /*
  * type_maximum_size --- determine maximum width of a variable-width column

@@ -4156,6 +4156,20 @@ get_query_def(Query *query, StringInfo buf, List *parentnamespace,
 	}
 }
 
+char *
+pg_get_viewstmt_definition(Query *viewParse)
+{
+	StringInfoData	buf;
+
+	initStringInfo(&buf);
+
+	get_query_def(viewParse, &buf, NIL, NULL, 0,
+				  WRAP_COLUMN_DEFAULT, 1);
+
+	return buf.data;
+}
+
+
 /* ----------
  * get_values_def			- Parse back a VALUES list
  * ----------

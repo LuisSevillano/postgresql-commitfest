@@ -49,6 +49,8 @@ extern void EventTriggerSQLDrop(Node *parsetree);
 
 extern bool EventTriggerBeginCompleteQuery(void);
 extern void EventTriggerEndCompleteQuery(void);
+extern void EventTriggerStashCreatedObject(Oid objectId, Oid classId,
+							   Node *parsetree);
 extern bool trackDroppedObjectsNeeded(void);
 extern void EventTriggerSQLDropAddObject(ObjectAddress *object);
 

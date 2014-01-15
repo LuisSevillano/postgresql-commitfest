@@ -2014,6 +2014,13 @@ add_object_address(ObjectClass oclass, Oid objectId, int32 subId,
 	addrs->numrefs++;
 }
 
+Oid
+get_class_catalog(ObjectClass oclass)
+{
+	Assert(oclass < MAX_OCLASS);
+	return object_classes[oclass];
+}
+
 /*
  * Add an entry to an ObjectAddresses array.
  *
