@@ -27,6 +27,7 @@
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/jsonapi.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -59,6 +60,7 @@ static void alen_array_element_start(void *state, bool isnull);
 
 /* common worker for json_each* functions */
 static inline Datum each_worker(PG_FUNCTION_ARGS, bool as_text);
+static inline Datum each_worker_jsonb(PG_FUNCTION_ARGS, bool as_text);
 
 /* semantic action functions for json_each */
 static void each_object_field_start(void *state, char *fname, bool isnull);
@@ -218,11 +220,85 @@ typedef struct PopulateRecordsetState
  *
  * This SRF operates in value-per-call mode. It processes the
  * object during the first call, and the keys are simply stashed
- * in an array, whise size is expanded as necessary. This is probably
+ * in an array, whose size is expanded as necessary. This is probably
  * safe enough for a list of keys of a single object, since they are
  * limited in size to NAMEDATALEN and the number of keys is unlikely to
  * be so huge that it has major memory implications.
  */
+
+Datum
+jsonb_object_keys(PG_FUNCTION_ARGS)
+{
+	FuncCallContext *funcctx;
+	OkeysState *state;
+	int			i;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext    oldcontext;
+		Jsonb           *jb = PG_GETARG_JSONB(0);
+		bool             skipNested = false;
+		JsonbIterator   *it;
+		JsonbValue	     v;
+		int              r = 0;
+
+	 
+		if (JB_ROOT_IS_SCALAR(jb))
+			elog(ERROR,"Cannot call jsonb_object_keys on a scalar");
+		else if (JB_ROOT_IS_ARRAY(jb))
+			elog(ERROR,"Cannot call jsonb_object_keys on an array");
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		state = palloc(sizeof(OkeysState));
+
+		state->result_size = JB_ROOT_COUNT(jb);
+		state->result_count = 0;
+		state->sent_count = 0;
+		state->result = palloc(state->result_size * sizeof(char *));
+
+		it = JsonbIteratorInit(VARDATA_ANY(jb));
+
+		while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+		{
+			skipNested = true;
+			
+			if (r == WJB_KEY)
+			{
+				char * cstr;
+
+				cstr = palloc(v.string.len+1 * sizeof(char));
+				memcpy(cstr,v.string.val, v.string.len);
+				cstr[v.string.len] = '\0';
+				state->result[state->result_count++] = cstr;
+			}
+		}
+
+
+		MemoryContextSwitchTo(oldcontext);
+		funcctx->user_fctx = (void *) state;
+
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	state = (OkeysState *) funcctx->user_fctx;
+
+	if (state->sent_count < state->result_count)
+	{
+		char	   *nxt = state->result[state->sent_count++];
+
+		SRF_RETURN_NEXT(funcctx, CStringGetTextDatum(nxt));
+	}
+
+	/* cleanup to reduce or eliminate memory leaks */
+	for (i = 0; i < state->result_count; i++)
+		pfree(state->result[i]);
+	pfree(state->result);
+	pfree(state);
+
+	SRF_RETURN_DONE(funcctx);
+}
 
 
 Datum
@@ -234,11 +310,25 @@ json_object_keys(PG_FUNCTION_ARGS)
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		text	   *json = PG_GETARG_TEXT_P(0);
-		JsonLexContext *lex = makeJsonLexContext(json, true);
+		text	   *json; //  = PG_GETARG_TEXT_P(0);
+		JsonLexContext *lex; //  = makeJsonLexContext(json, true);
 		JsonSemAction *sem;
 
 		MemoryContext oldcontext;
+
+		if (get_fn_expr_argtype(fcinfo->flinfo, 0) == JSONOID)
+		{
+			/* just get the text */
+			json = PG_GETARG_TEXT_P(0);
+		}
+		else
+		{
+			Jsonb      *jb = PG_GETARG_JSONB(0);
+			
+			json = cstring_to_text(JsonbToCString(NULL, (JB_ISEMPTY(jb)) ? NULL : VARDATA(jb), VARSIZE(jb)));
+		}
+
+		lex = makeJsonLexContext(json, true);
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
@@ -336,9 +426,9 @@ okeys_scalar(void *state, char *token, JsonTokenType tokentype)
 }
 
 /*
- * json getter functions
+ * json and jsonb getter functions
  * these implement the -> ->> #> and #>> operators
- * and the json_extract_path*(json, text, ...) functions
+ * and the json{b?}_extract_path*(json, text, ...) functions
  */
 
 
@@ -359,6 +449,50 @@ json_object_field(PG_FUNCTION_ARGS)
 }
 
 Datum
+jsonb_object_field(PG_FUNCTION_ARGS)
+{
+	Jsonb      *jb = PG_GETARG_JSONB(0);
+	char	   *key =  text_to_cstring(PG_GETARG_TEXT_P(1));
+	int         klen = strlen(key);
+	
+	JsonbIterator   *it;
+	JsonbValue       v;
+	int              r = 0;
+	bool             skipNested = false;
+    
+   if (JB_ROOT_IS_SCALAR(jb))
+       elog(ERROR,"Cannot call jsonb_object_field on a scalar");
+   else if (JB_ROOT_IS_ARRAY(jb))
+       elog(ERROR,"Cannot call jsonb_object_field on an array");
+
+   Assert(JB_ROOT_IS_OBJECT(jb));
+
+	it = JsonbIteratorInit(VARDATA_ANY(jb));
+
+	while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+	{
+		skipNested = true;
+		
+		// elog(NOTICE, "r = %d",r);
+		
+		if (r == WJB_KEY)
+		{
+			if (klen == v.string.len && strncmp(key, v.string.val, klen) == 0)
+			{
+				/*
+				 * The next thing the iterator fetches should be the
+				 * value, no matter what shape it is.
+				 */
+				r = JsonbIteratorGet(&it, &v, skipNested);
+				PG_RETURN_JSONB(JsonbValueToJsonb(&v));
+			}
+		}
+	}
+
+	PG_RETURN_NULL(); 
+}
+
+Datum
 json_object_field_text(PG_FUNCTION_ARGS)
 {
 	text	   *json = PG_GETARG_TEXT_P(0);
@@ -372,6 +506,70 @@ json_object_field_text(PG_FUNCTION_ARGS)
 		PG_RETURN_TEXT_P(result);
 	else
 		PG_RETURN_NULL();
+}
+
+Datum
+jsonb_object_field_text(PG_FUNCTION_ARGS)
+{
+	Jsonb      *jb = PG_GETARG_JSONB(0);
+	char	   *key =  text_to_cstring(PG_GETARG_TEXT_P(1));
+	int         klen = strlen(key);
+	
+	JsonbIterator   *it;
+	JsonbValue       v;
+	int              r = 0;
+	bool             skipNested = false;
+    
+	if (JB_ROOT_IS_SCALAR(jb))
+		elog(ERROR,"Cannot call jsonb_object_field on a scalar");
+	else if (JB_ROOT_IS_ARRAY(jb))
+		elog(ERROR,"Cannot call jsonb_object_field on an array");
+	
+	Assert(JB_ROOT_IS_OBJECT(jb));
+	
+	it = JsonbIteratorInit(VARDATA_ANY(jb));
+	
+	while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+	{
+		skipNested = true;
+		
+		// elog(NOTICE, "r = %d",r);
+		
+		if (r == WJB_KEY)
+		{
+			if (klen == v.string.len && strncmp(key, v.string.val, klen) == 0)
+			{
+				text *result;
+				/*
+				 * The next thing the iterator fetches should be the
+				 * value, no matter what shape it is.
+				 */
+				r = JsonbIteratorGet(&it, &v, skipNested);
+				/* 
+				 * if it's a scalar string it needs to be de-escaped, 
+				 * otherwise just return the text 
+				 */
+				if (v.type == jbvString)
+				{
+					result = cstring_to_text_with_len(v.string.val, v.string.len);
+				}
+				else if (v.type == jbvNull)
+				{
+					PG_RETURN_NULL(); 
+				}
+				else
+				{
+					StringInfo jtext = makeStringInfo();
+					Jsonb *tjb = JsonbValueToJsonb(&v);
+					(void) JsonbToCString(jtext, VARDATA(tjb), -1);
+					result = cstring_to_text_with_len(jtext->data, jtext->len);
+				}
+				PG_RETURN_TEXT_P(result);
+			}
+		}
+	}
+
+	PG_RETURN_NULL(); 
 }
 
 Datum
@@ -390,6 +588,40 @@ json_array_element(PG_FUNCTION_ARGS)
 }
 
 Datum
+jsonb_array_element(PG_FUNCTION_ARGS)
+{
+	Jsonb      *jb = PG_GETARG_JSONB(0);
+	int			element = PG_GETARG_INT32(1);
+	JsonbIterator   *it;
+	JsonbValue       v;
+	int              r = 0;
+	bool             skipNested = false;
+	int              element_number = 0;
+    
+   if (JB_ROOT_IS_SCALAR(jb))
+       elog(ERROR,"Cannot call jsonb_array_element on a scalar");
+   else if (JB_ROOT_IS_OBJECT(jb))
+       elog(ERROR,"Cannot call jsonb_array_element on an object");
+
+   Assert(JB_ROOT_IS_ARRAY(jb));
+
+	it = JsonbIteratorInit(VARDATA_ANY(jb));
+
+	while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+	{
+		skipNested = true;
+		
+		if (r == WJB_ELEM)
+		{
+			if (element_number++ == element)
+				PG_RETURN_JSONB(JsonbValueToJsonb(&v));
+		}
+	}
+
+	PG_RETURN_NULL(); 
+}
+
+Datum
 json_array_element_text(PG_FUNCTION_ARGS)
 {
 	text	   *json = PG_GETARG_TEXT_P(0);
@@ -405,7 +637,73 @@ json_array_element_text(PG_FUNCTION_ARGS)
 }
 
 Datum
+jsonb_array_element_text(PG_FUNCTION_ARGS)
+{
+	Jsonb      *jb = PG_GETARG_JSONB(0);
+	int			element = PG_GETARG_INT32(1);
+	JsonbIterator   *it;
+	JsonbValue       v;
+	int              r = 0;
+	bool             skipNested = false;
+	int              element_number = 0;
+
+    
+   if (JB_ROOT_IS_SCALAR(jb))
+       elog(ERROR,"Cannot call jsonb_array_element_text on a scalar");
+   else if (JB_ROOT_IS_OBJECT(jb))
+       elog(ERROR,"Cannot call jsonb_array_element_text on an object");
+
+   Assert(JB_ROOT_IS_ARRAY(jb));
+
+	it = JsonbIteratorInit(VARDATA_ANY(jb));
+
+	while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+	{
+		skipNested = true;
+		
+		// elog(NOTICE, "r = %d",r);
+		
+		if (r == WJB_ELEM)
+		{
+			
+			if (element_number++ == element)
+			{
+				/* 
+				 * if it's a scalar string it needs to be de-escaped, 
+				 * otherwise just return the text 
+				 */
+				text *result;
+				if (v.type == jbvString)
+				{
+					result = cstring_to_text_with_len(v.string.val, v.string.len);
+				}
+				else if (v.type == jbvNull)
+				{
+					PG_RETURN_NULL(); 
+				}
+				else
+				{
+					StringInfo jtext = makeStringInfo();
+					Jsonb *tjb = JsonbValueToJsonb(&v);
+					(void) JsonbToCString(jtext, VARDATA(tjb), -1);
+					result = cstring_to_text_with_len(jtext->data, jtext->len);
+				}
+				PG_RETURN_TEXT_P(result);
+			}
+		}
+	}
+
+	PG_RETURN_NULL(); 
+}
+
+Datum
 json_extract_path(PG_FUNCTION_ARGS)
+{
+	return get_path_all(fcinfo, false);
+}
+
+Datum
+jsonb_extract_path(PG_FUNCTION_ARGS)
 {
 	return get_path_all(fcinfo, false);
 }
@@ -416,13 +714,20 @@ json_extract_path_text(PG_FUNCTION_ARGS)
 	return get_path_all(fcinfo, true);
 }
 
+Datum
+jsonb_extract_path_text(PG_FUNCTION_ARGS)
+{
+	return get_path_all(fcinfo, true);
+}
+
 /*
  * common routine for extract_path functions
  */
 static inline Datum
 get_path_all(PG_FUNCTION_ARGS, bool as_text)
 {
-	text	   *json = PG_GETARG_TEXT_P(0);
+	Oid			val_type = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	text	   *json;
 	ArrayType  *path = PG_GETARG_ARRAYTYPE_P(1);
 	text	   *result;
 	Datum	   *pathtext;
@@ -433,6 +738,19 @@ get_path_all(PG_FUNCTION_ARGS, bool as_text)
 	int			i;
 	long		ind;
 	char	   *endptr;
+
+	Assert(val_type == JSONOID || val_type == JSONBOID);
+	if (val_type == JSONOID)
+	{
+		/* just get the text */
+		json = PG_GETARG_TEXT_P(0);
+	}
+	else
+	{
+		Jsonb      *jb = PG_GETARG_JSONB(0);
+
+		json = cstring_to_text(JsonbToCString(NULL, (JB_ISEMPTY(jb)) ? NULL : VARDATA(jb), VARSIZE(jb)));
+	}
 
 	if (array_contains_nulls(path))
 		ereport(ERROR,
@@ -472,9 +790,17 @@ get_path_all(PG_FUNCTION_ARGS, bool as_text)
 	result = get_worker(json, NULL, -1, tpath, ipath, npath, as_text);
 
 	if (result != NULL)
-		PG_RETURN_TEXT_P(result);
+	{
+		if (val_type == JSONOID || as_text)
+			PG_RETURN_TEXT_P(result);
+		else
+			PG_RETURN_JSONB(DirectFunctionCall1(jsonb_in, CStringGetDatum(text_to_cstring(result))));
+	}
 	else
+	{
+		/* null is null regardless */
 		PG_RETURN_NULL();
+	}
 }
 
 /*
@@ -654,7 +980,7 @@ get_object_field_end(void *state, char *fname, bool isnull)
 		/*
 		 * make a text object from the string from the prevously noted json
 		 * start up to the end of the previous token (the lexer is by now
-		 * ahead of us on whatevere came after what we're interested in).
+		 * ahead of us on whatever came after what we're interested in).
 		 */
 		int			len = _state->lex->prev_token_terminator - _state->result_start;
 
@@ -814,12 +1140,14 @@ get_scalar(void *state, char *token, JsonTokenType tokentype)
 Datum
 json_array_length(PG_FUNCTION_ARGS)
 {
-	text	   *json = PG_GETARG_TEXT_P(0);
+	text	   *json;
 
 	AlenState  *state;
-	JsonLexContext *lex = makeJsonLexContext(json, false);
+	JsonLexContext *lex;
 	JsonSemAction *sem;
 
+	json = PG_GETARG_TEXT_P(0);
+	lex = makeJsonLexContext(json, false);
 	state = palloc0(sizeof(AlenState));
 	sem = palloc0(sizeof(JsonSemAction));
 
@@ -837,6 +1165,24 @@ json_array_length(PG_FUNCTION_ARGS)
 	pg_parse_json(lex, sem);
 
 	PG_RETURN_INT32(state->count);
+}
+
+Datum
+jsonb_array_length(PG_FUNCTION_ARGS)
+{
+	Jsonb *jb = PG_GETARG_JSONB(0);
+
+	if (JB_ROOT_IS_SCALAR(jb))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot get array length of a scalar")));
+	else if (! JB_ROOT_IS_ARRAY(jb))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot get array length of a non-array")));
+
+	PG_RETURN_INT32(JB_ROOT_COUNT(jb));
+	
 }
 
 /*
@@ -895,22 +1241,166 @@ json_each(PG_FUNCTION_ARGS)
 }
 
 Datum
+jsonb_each(PG_FUNCTION_ARGS)
+{
+	return each_worker_jsonb(fcinfo, false);
+}
+
+Datum
 json_each_text(PG_FUNCTION_ARGS)
 {
 	return each_worker(fcinfo, true);
 }
 
+Datum
+jsonb_each_text(PG_FUNCTION_ARGS)
+{
+	return each_worker_jsonb(fcinfo, true);
+}
+
+static inline Datum
+each_worker_jsonb(PG_FUNCTION_ARGS, bool as_text)
+{
+	Jsonb *jb = PG_GETARG_JSONB(0);
+	ReturnSetInfo *rsi;
+	Tuplestorestate *tuple_store;
+	TupleDesc	tupdesc;
+	TupleDesc	ret_tdesc;
+	MemoryContext old_cxt, tmp_cxt;
+	bool             skipNested = false;
+	JsonbIterator   *it;
+	JsonbValue	     v;
+	int              r = 0;
+
+	if (!JB_ROOT_IS_OBJECT(jb))
+		elog(ERROR,"cannot call %s on a non-object",
+			 as_text ? "jsonb_each_text" : "jsonb_each");
+
+	rsi = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	if (!rsi || !IsA(rsi, ReturnSetInfo) ||
+		(rsi->allowedModes & SFRM_Materialize) == 0 ||
+		rsi->expectedDesc == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that "
+						"cannot accept a set")));
+
+
+	rsi->returnMode = SFRM_Materialize;
+
+	(void) get_call_result_type(fcinfo, NULL, &tupdesc);
+
+	old_cxt = MemoryContextSwitchTo(rsi->econtext->ecxt_per_query_memory);
+
+	ret_tdesc = CreateTupleDescCopy(tupdesc);
+	BlessTupleDesc(ret_tdesc);
+	tuple_store =
+		tuplestore_begin_heap(rsi->allowedModes & SFRM_Materialize_Random,
+							  false, work_mem);
+
+	MemoryContextSwitchTo(old_cxt);
+
+	tmp_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"jsonb_each temporary cxt",
+									ALLOCSET_DEFAULT_MINSIZE,
+									ALLOCSET_DEFAULT_INITSIZE,
+									ALLOCSET_DEFAULT_MAXSIZE);
+
+
+	it = JsonbIteratorInit(VARDATA_ANY(jb));
+
+	while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+	{
+		skipNested = true;
+		
+		if (r == WJB_KEY)
+		{
+			text *key;
+			HeapTuple	tuple;
+			Datum		values[2];
+			bool		nulls[2] = {false, false};
+			
+			/* use the tmp context so we can clean up after each tuple is done */
+			old_cxt = MemoryContextSwitchTo(tmp_cxt);
+
+			key = cstring_to_text_with_len(v.string.val, v.string.len);
+
+			/*
+			 * The next thing the iterator fetches should be the
+			 * value, no matter what shape it is.
+			 */
+			r = JsonbIteratorGet(&it, &v, skipNested);
+			 
+			values[0] = PointerGetDatum(key);
+
+			if (as_text)
+			{
+				if (v.type == jbvNull)
+				{
+					/* a json null is an sql null in text mode */
+					nulls[1] = true;
+					values[1] = (Datum) NULL;
+				}
+				else 
+				{ 
+					text *sv;
+
+					if (v.type == jbvString)
+					{
+						/* in text mode scalar strings should be dequoted */
+						sv = cstring_to_text_with_len(v.string.val, v.string.len);
+					}
+					else
+					{
+						/* turn anything else into a json string */
+						StringInfo jtext = makeStringInfo();
+						Jsonb *jb = JsonbValueToJsonb(&v);
+						(void) JsonbToCString(jtext, VARDATA(jb), 2 * v.size);
+						sv = cstring_to_text_with_len(jtext->data, jtext->len);
+					}
+
+					values[1] = PointerGetDatum(sv);
+				}
+			}
+			else
+			{
+				/* not in text mode, just return the Jsonb */
+				Jsonb *val = JsonbValueToJsonb(&v);
+				values[1] = PointerGetDatum(val);
+			}
+
+			tuple = heap_form_tuple(ret_tdesc, values, nulls);
+
+			tuplestore_puttuple(tuple_store, tuple);
+
+			/* clean up and switch back */
+			MemoryContextSwitchTo(old_cxt);
+			MemoryContextReset(tmp_cxt);
+		}
+	}
+
+	rsi->setResult = tuple_store;
+	rsi->setDesc = ret_tdesc;
+
+	PG_RETURN_NULL();	
+}
+
+
 static inline Datum
 each_worker(PG_FUNCTION_ARGS, bool as_text)
 {
-	text	   *json = PG_GETARG_TEXT_P(0);
-	JsonLexContext *lex = makeJsonLexContext(json, true);
+	text	   *json;
+	JsonLexContext *lex;
 	JsonSemAction *sem;
 	ReturnSetInfo *rsi;
 	MemoryContext old_cxt;
 	TupleDesc	tupdesc;
 	EachState  *state;
 
+	json = PG_GETARG_TEXT_P(0);
+
+	lex = makeJsonLexContext(json, true);
 	state = palloc0(sizeof(EachState));
 	sem = palloc0(sizeof(JsonSemAction));
 
@@ -1067,19 +1557,113 @@ each_scalar(void *state, char *token, JsonTokenType tokentype)
  *
  * a lot of this processing is similar to the json_each* functions
  */
+
+Datum
+jsonb_array_elements(PG_FUNCTION_ARGS)
+{
+	Jsonb *jb = PG_GETARG_JSONB(0);
+	ReturnSetInfo *rsi;
+	Tuplestorestate *tuple_store;
+	TupleDesc	tupdesc;
+	TupleDesc	ret_tdesc;
+	MemoryContext old_cxt, tmp_cxt;
+	bool             skipNested = false;
+	JsonbIterator   *it;
+	JsonbValue	     v;
+	int              r = 0;
+
+	if (JB_ROOT_IS_SCALAR(jb)) 
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot extract elements from a scalar")));
+	else if (! JB_ROOT_IS_ARRAY(jb)) 
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cannot extract elements from an object")));
+
+	rsi = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	if (!rsi || !IsA(rsi, ReturnSetInfo) ||
+		(rsi->allowedModes & SFRM_Materialize) == 0 ||
+		rsi->expectedDesc == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that "
+						"cannot accept a set")));
+
+
+	rsi->returnMode = SFRM_Materialize;
+
+	/* it's a simple type, so don't use get_call_result_type() */
+	tupdesc = rsi->expectedDesc;
+
+	old_cxt = MemoryContextSwitchTo(rsi->econtext->ecxt_per_query_memory);
+
+	ret_tdesc = CreateTupleDescCopy(tupdesc);
+	BlessTupleDesc(ret_tdesc);
+	tuple_store =
+		tuplestore_begin_heap(rsi->allowedModes & SFRM_Materialize_Random,
+							  false, work_mem);
+
+	MemoryContextSwitchTo(old_cxt);
+
+	tmp_cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"jsonb_each temporary cxt",
+									ALLOCSET_DEFAULT_MINSIZE,
+									ALLOCSET_DEFAULT_INITSIZE,
+									ALLOCSET_DEFAULT_MAXSIZE);
+
+
+	it = JsonbIteratorInit(VARDATA_ANY(jb));
+
+	while((r = JsonbIteratorGet(&it, &v, skipNested)) != 0)
+	{
+		skipNested = true;
+		
+		if (r == WJB_ELEM)
+		{
+			HeapTuple	tuple;
+			Datum		values[1];
+			bool		nulls[1] = {false};
+			Jsonb      *val;
+			
+			/* use the tmp context so we can clean up after each tuple is done */
+			old_cxt = MemoryContextSwitchTo(tmp_cxt);
+
+			val = JsonbValueToJsonb(&v);
+			values[0] = PointerGetDatum(val);
+
+			tuple = heap_form_tuple(ret_tdesc, values, nulls);
+
+			tuplestore_puttuple(tuple_store, tuple);
+
+			/* clean up and switch back */
+			MemoryContextSwitchTo(old_cxt);
+			MemoryContextReset(tmp_cxt);
+		}
+	}
+
+	rsi->setResult = tuple_store;
+	rsi->setDesc = ret_tdesc;
+
+	PG_RETURN_NULL();	
+}
+
 Datum
 json_array_elements(PG_FUNCTION_ARGS)
 {
-	text	   *json = PG_GETARG_TEXT_P(0);
-
-	/* elements doesn't need any escaped strings, so use false here */
-	JsonLexContext *lex = makeJsonLexContext(json, false);
+	text	   *json;
+	JsonLexContext *lex;
 	JsonSemAction *sem;
 	ReturnSetInfo *rsi;
 	MemoryContext old_cxt;
 	TupleDesc	tupdesc;
 	ElementsState *state;
 
+	json = PG_GETARG_TEXT_P(0);
+
+	/* elements doesn't need any escaped strings, so use false here */
+	lex  = makeJsonLexContext(json, false);
 	state = palloc0(sizeof(ElementsState));
 	sem = palloc0(sizeof(JsonSemAction));
 
@@ -1214,9 +1798,16 @@ elements_scalar(void *state, char *token, JsonTokenType tokentype)
  * field in the record is then looked up by name.
  */
 Datum
+jsonb_populate_record(PG_FUNCTION_ARGS)
+{
+	return json_populate_record(fcinfo);
+}
+
+Datum
 json_populate_record(PG_FUNCTION_ARGS)
 {
 	Oid			argtype = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid         jtype = get_fn_expr_argtype(fcinfo->flinfo, 1);
 	text	   *json;
 	bool		use_json_as_text;
 	HTAB	   *json_hash;
@@ -1233,6 +1824,8 @@ json_populate_record(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	char		fname[NAMEDATALEN];
 	JsonHashEntry *hashentry;
+
+	Assert(jtype == JSONOID || jtype == JSONBOID);
 
 	use_json_as_text = PG_ARGISNULL(2) ? false : PG_GETARG_BOOL(2);
 
@@ -1268,7 +1861,17 @@ json_populate_record(PG_FUNCTION_ARGS)
 		tupTypmod = HeapTupleHeaderGetTypMod(rec);
 	}
 
-	json = PG_GETARG_TEXT_P(1);
+	if (jtype == JSONOID)
+	{
+		/* just get the text */
+		json = PG_GETARG_TEXT_P(1);
+	}
+	else
+	{
+		Jsonb      *jb = PG_GETARG_JSONB(1);
+		
+		json = cstring_to_text(JsonbToCString(NULL, (JB_ISEMPTY(jb)) ? NULL : VARDATA(jb), VARSIZE(jb)));
+	}
 
 	json_hash = get_json_object_as_hash(json, "json_populate_record", use_json_as_text);
 
@@ -1559,9 +2162,17 @@ hash_scalar(void *state, char *token, JsonTokenType tokentype)
  * per object in the array.
  */
 Datum
+jsonb_populate_recordset(PG_FUNCTION_ARGS)
+{
+	return json_populate_recordset(fcinfo);
+}
+
+
+Datum
 json_populate_recordset(PG_FUNCTION_ARGS)
 {
 	Oid			argtype = get_fn_expr_argtype(fcinfo->flinfo, 0);
+	Oid         jtype = get_fn_expr_argtype(fcinfo->flinfo, 1);
 	text	   *json;
 	bool		use_json_as_text;
 	ReturnSetInfo *rsi;
@@ -1621,7 +2232,17 @@ json_populate_recordset(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(1))
 		PG_RETURN_NULL();
 
-	json = PG_GETARG_TEXT_P(1);
+	if (jtype == JSONOID)
+	{
+		/* just get the text */
+		json = PG_GETARG_TEXT_P(1);
+	}
+	else
+	{
+		Jsonb      *jb = PG_GETARG_JSONB(1);
+		
+		json = cstring_to_text(JsonbToCString(NULL, (JB_ISEMPTY(jb)) ? NULL : VARDATA(jb), VARSIZE(jb)));
+	}
 
 	if (PG_ARGISNULL(0))
 		rec = NULL;
