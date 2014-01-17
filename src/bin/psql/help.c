@@ -99,7 +99,7 @@ usage(void)
 	printf(_("\nOutput format options:\n"));
 	printf(_("  -A, --no-align           unaligned table output mode\n"));
 	printf(_("  -F, --field-separator=STRING\n"
-	   "                           set field separator (default: \"%s\")\n"),
+	   "                           set field separator for unaligned output (default: \"%s\")\n"),
 		   DEFAULT_FIELD_SEP);
 	printf(_("  -H, --html               HTML table output mode\n"));
 	printf(_("  -P, --pset=VAR[=ARG]     set printing option VAR to ARG (see \\pset command)\n"));
