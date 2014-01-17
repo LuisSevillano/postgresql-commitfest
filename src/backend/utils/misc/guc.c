@@ -569,6 +569,8 @@ const char *const config_group_names[] =
 	gettext_noop("Resource Usage / Disk"),
 	/* RESOURCES_KERNEL */
 	gettext_noop("Resource Usage / Kernel Resources"),
+	/* RESOURCES_WAL_RATE_LIMIT */
+	gettext_noop("Resource Usage / WAL Rate Limiting"),
 	/* RESOURCES_VACUUM_DELAY */
 	gettext_noop("Resource Usage / Cost-Based Vacuum Delay"),
 	/* RESOURCES_BGWRITER */
@@ -1866,6 +1868,16 @@ static struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"wal_rate_limit", PGC_USERSET, RESOURCES_WAL_RATE_LIMIT,
+			gettext_noop("WAL rate limit delay in milliseconds."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&WALRateLimit,
+		0, 0, 100,
+		NULL, NULL, NULL
+	},
 	{
 		{"autovacuum_vacuum_cost_delay", PGC_SIGHUP, AUTOVACUUM,
 			gettext_noop("Vacuum cost delay in milliseconds, for autovacuum."),

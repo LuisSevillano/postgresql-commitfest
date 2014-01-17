@@ -1026,6 +1026,8 @@ ExecModifyTable(ModifyTableState *node)
 				break;
 		}
 
+		CHECK_FOR_WAL_BUDGET();
+
 		/*
 		 * If we got a RETURNING result, return it to caller.  We'll continue
 		 * the work on next call.

@@ -926,6 +926,8 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 						get_namespace_name(RelationGetNamespace(OldHeap)),
 						RelationGetRelationName(OldHeap))));
 
+	init_wal_rate_limit();
+
 	/*
 	 * Scan through the OldHeap, either in OldIndex order or sequentially;
 	 * copy each tuple into the NewHeap, or transiently to the tuplesort
@@ -939,6 +941,9 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 		bool		isdead;
 
 		CHECK_FOR_INTERRUPTS();
+
+		if (use_wal)
+			CHECK_FOR_WAL_BUDGET();
 
 		if (indexScan != NULL)
 		{

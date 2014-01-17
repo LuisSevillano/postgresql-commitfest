@@ -60,7 +60,7 @@ int			vacuum_freeze_table_age;
 /* A few variables that don't seem worth passing around as parameters */
 static MemoryContext vac_context = NULL;
 static BufferAccessStrategy vac_strategy;
-
+static uint64 prevWALchunks = 0;
 
 /* non-export function prototypes */
 static List *get_rel_oids(Oid relid, const RangeVar *vacrel);
@@ -1288,6 +1288,54 @@ vacuum_delay_point(void)
 
 		/* update balance values for workers */
 		AutoVacuumUpdateDelay();
+
+		/* Might have gotten an interrupt while sleeping */
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * WAL Rate Limiting will wait after each "chunk" of WAL.
+ */
+#define WALRateLimitBytesPerChunk	65536
+#define GetCurrentTransactionChunks() \
+	(GetCurrentTransactionWALVolume() / WALRateLimitBytesPerChunk )
+/*
+ * init_wal_rate_limit - initialize for WAL rate limiting
+ */
+void
+init_wal_rate_limit(void)
+{
+	prevWALchunks = GetCurrentTransactionChunks();
+}
+
+/*
+ * CHECK_FOR_WAL_BUDGET --- check for interrupts and cost-based delay.
+ *
+ * This should be called in each major loop of maintenance command processing,
+ * typically once per page processed when generating large amounts of WAL.
+ *
+ * Listed in miscadmin.h for general use.
+ */
+void
+CHECK_FOR_WAL_BUDGET(void)
+{
+	uint64 currWALchunks;
+
+	if (WALRateLimit == 0)
+		return;
+
+	/*
+	 * Fine out how many chunks of WAL have been written
+	 */
+	currWALchunks = GetCurrentTransactionChunks();
+
+	/* Nap if appropriate */
+	if (currWALchunks > prevWALchunks)
+	{
+		prevWALchunks = currWALchunks;
+
+		pg_usleep(WALRateLimit * 1000L);
 
 		/* Might have gotten an interrupt while sleeping */
 		CHECK_FOR_INTERRUPTS();

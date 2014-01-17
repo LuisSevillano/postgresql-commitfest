@@ -460,6 +460,9 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 	 */
 	CHECK_FOR_INTERRUPTS();
 
+	if (wstate->btws_use_wal)
+		CHECK_FOR_WAL_BUDGET();
+
 	npage = state->btps_page;
 	nblkno = state->btps_blkno;
 	last_off = state->btps_lastoff;

@@ -3839,6 +3839,8 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
 				dropped_attrs = lappend_int(dropped_attrs, i);
 		}
 
+		init_wal_rate_limit();
+
 		/*
 		 * Scan through the rows, generating a new row if needed and then
 		 * checking all the constraints.
@@ -3947,6 +3949,9 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
 			ResetExprContext(econtext);
 
 			CHECK_FOR_INTERRUPTS();
+
+			if (hi_options & HEAP_INSERT_SKIP_WAL)
+				CHECK_FOR_WAL_BUDGET();
 		}
 
 		MemoryContextSwitchTo(oldCxt);
@@ -9143,10 +9148,15 @@ copy_relation_data(SMgrRelation src, SMgrRelation dst,
 
 	nblocks = smgrnblocks(src, forkNum);
 
+	init_wal_rate_limit();
+
 	for (blkno = 0; blkno < nblocks; blkno++)
 	{
 		/* If we got a cancel signal during the copy of the data, quit */
 		CHECK_FOR_INTERRUPTS();
+
+		if (use_wal)
+			CHECK_FOR_WAL_BUDGET();
 
 		smgrread(src, forkNum, blkno, buf);
 

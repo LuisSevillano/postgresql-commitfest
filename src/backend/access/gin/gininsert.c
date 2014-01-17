@@ -298,6 +298,8 @@ ginBuildCallback(Relation index, HeapTuple htup, Datum *values,
 		{
 			/* there could be many entries, so be willing to abort here */
 			CHECK_FOR_INTERRUPTS();
+			if (RelationNeedsWAL(index))
+				CHECK_FOR_WAL_BUDGET();
 			ginEntryInsert(&buildstate->ginstate, attnum, key, category,
 						   list, nlist, &buildstate->buildStats);
 		}

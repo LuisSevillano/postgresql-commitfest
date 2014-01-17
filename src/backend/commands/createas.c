@@ -460,6 +460,9 @@ intorel_receive(TupleTableSlot *slot, DestReceiver *self)
 				myState->hi_options,
 				myState->bistate);
 
+	if (myState->hi_options & HEAP_INSERT_SKIP_WAL)
+		CHECK_FOR_WAL_BUDGET();
+
 	/* We know this is a newly created relation, so there are no indexes */
 }
 

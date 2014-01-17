@@ -563,6 +563,9 @@ gistProcessItup(GISTBuildState *buildstate, IndexTuple itup,
 
 	CHECK_FOR_INTERRUPTS();
 
+	if (RelationNeedsWAL(indexrel))
+		CHECK_FOR_WAL_BUDGET();
+
 	/*
 	 * Loop until we reach a leaf page (level == 0) or a level with buffers
 	 * (not including the level we start at, because we would otherwise make

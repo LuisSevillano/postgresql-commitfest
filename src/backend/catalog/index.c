@@ -2163,6 +2163,8 @@ IndexBuildHeapScan(Relation heapRelation,
 		OldestXmin = GetOldestXmin(heapRelation->rd_rel->relisshared, true);
 	}
 
+	init_wal_rate_limit();
+
 	scan = heap_beginscan_strat(heapRelation,	/* relation */
 								snapshot,		/* snapshot */
 								0,		/* number of keys */

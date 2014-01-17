@@ -147,6 +147,10 @@
 					# (change requires restart)
 #shared_preload_libraries = ''		# (change requires restart)
 
+# - WAL Rate Limiting -
+
+#wal_rate_limit = 0			# 0-100 milliseconds
+
 # - Cost-Based Vacuum Delay -
 
 #vacuum_cost_delay = 0			# 0-100 milliseconds

@@ -226,6 +226,10 @@ extern bool allowSystemTableMods;
 extern PGDLLIMPORT int work_mem;
 extern PGDLLIMPORT int maintenance_work_mem;
 
+extern void init_wal_rate_limit(void);
+extern void CHECK_FOR_WAL_BUDGET(void);
+extern int  WALRateLimit;
+
 extern int	VacuumCostPageHit;
 extern int	VacuumCostPageMiss;
 extern int	VacuumCostPageDirty;

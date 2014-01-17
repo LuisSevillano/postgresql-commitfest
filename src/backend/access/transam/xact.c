@@ -183,6 +183,12 @@ static TransactionStateData TopTransactionStateData = {
 };
 
 /*
+ * Track total volume of WAL written by current top-level transaction
+ * to allow tracking, reporting and control of writing WAL.
+ */
+static uint64 currentTransactionWALVolume;
+
+/*
  * unreportedXids holds XIDs of all subtransactions that have not yet been
  * reported in a XLOG_XACT_ASSIGNMENT record.
  */
@@ -397,17 +403,26 @@ GetCurrentTransactionIdIfAny(void)
 }
 
 /*
- *	MarkCurrentTransactionIdLoggedIfAny
+ * ReportTransactionInsertedWAL
  *
- * Remember that the current xid - if it is assigned - now has been wal logged.
+ * Remember that the current xid - if it is assigned - has now inserted WAL
  */
 void
-MarkCurrentTransactionIdLoggedIfAny(void)
+ReportTransactionInsertedWAL(uint32 insertedWALVolume)
 {
+	currentTransactionWALVolume += insertedWALVolume;
 	if (TransactionIdIsValid(CurrentTransactionState->transactionId))
 		CurrentTransactionState->didLogXid = true;
 }
 
+/*
+ * GetCurrentTransactionWALVolume
+ */
+uint64
+GetCurrentTransactionWALVolume(void)
+{
+	return currentTransactionWALVolume;
+}
 
 /*
  *	GetStableLatestTransactionId
@@ -1772,6 +1787,7 @@ StartTransaction(void)
 	/*
 	 * initialize reported xid accounting
 	 */
+	currentTransactionWALVolume = 0;
 	nUnreportedXids = 0;
 	s->didLogXid = false;
 

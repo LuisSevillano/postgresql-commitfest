@@ -1916,6 +1916,9 @@ spgdoinsert(Relation index, SpGistState *state,
 		 */
 		CHECK_FOR_INTERRUPTS();
 
+		if (RelationNeedsWAL(index))
+			CHECK_FOR_WAL_BUDGET();
+
 		if (current.blkno == InvalidBlockNumber)
 		{
 			/*

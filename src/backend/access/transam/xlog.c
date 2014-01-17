@@ -1197,6 +1197,7 @@ begin:;
 		 * already exactly at the beginning of a segment, so there was no need
 		 * to do anything.
 		 */
+		write_len = 0;
 	}
 
 	/*
@@ -1204,7 +1205,7 @@ begin:;
 	 */
 	WALInsertSlotRelease();
 
-	MarkCurrentTransactionIdLoggedIfAny();
+	ReportTransactionInsertedWAL(write_len);
 
 	END_CRIT_SECTION();
 

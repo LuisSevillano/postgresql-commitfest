@@ -2195,6 +2195,9 @@ CopyFrom(CopyState cstate)
 
 		CHECK_FOR_INTERRUPTS();
 
+		if (hi_options & HEAP_INSERT_SKIP_WAL)
+			CHECK_FOR_WAL_BUDGET();
+
 		if (nBufferedTuples == 0)
 		{
 			/*

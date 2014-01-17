@@ -1391,6 +1391,68 @@ include 'filename'
      </variablelist>
     </sect2>
 
+    <sect2 id="runtime-config-resource-wal-rate-limit">
+     <title>WAL Rate Limiting</title>
+
+     <para>
+      During the execution of commands that may produce large volumes of WAL,
+      such as <command>INSERT SELECT</command>, <command>COPY</command>,
+      <command>CLUSTER</command>, <command>ALTER TABLE</command>,
+      <command>CREATE INDEX</command>, the system maintains an
+      internal counter that keeps track of the volume of WAL written.
+      When the accumulated WAL volume reaches a multiple of 64kB
+      the process performing
+      the operation will sleep for a short period of time, as specified by
+      <varname>wal_rate_limit</varname>. Then it will reset the
+      counter and continue execution.
+     </para>
+
+     <para>
+      The intent of this feature is to allow administrators to reduce
+      the impact of these commands on concurrent database activity
+      and replication.  There are many situations where it is not
+      important that bulk write commands finish quickly;
+      however, it is usually very important that these
+      commands do not significantly interfere with the ability of the
+      system to perform other database operations. WAL Rate Limiting
+      provides a way for administrators to achieve this.
+     </para>
+
+     <para>
+      This feature is disabled by default.  To enable it, set the
+      <varname>wal_rate_limit</varname> variable to a nonzero
+      value, when <varname>wal_level</varname> is set to
+      <literal>archive</literal> or higher.
+     </para>
+
+     <variablelist>
+      <varlistentry id="guc-wal-rate-limit" xreflabel="wal_rate_limit">
+       <term><varname>wal_rate_limit</varname> (<type>integer</type>)</term>
+       <indexterm>
+        <primary><varname>wal_rate_limit</> configuration parameter</primary>
+       </indexterm>
+       <listitem>
+        <para>
+         The length of time, in milliseconds, that the process will sleep
+         when the cost limit has been exceeded.
+         The default value is zero, which disables the WAL Rate Limiting
+         feature.  Positive values enable WAL Rate Limiting.
+         Note that on many systems, the effective resolution
+         of sleep delays is 10 milliseconds; setting
+         <varname>wal_rate_limit</varname> to a value that is
+         not a multiple of 10 might have the same results as setting it
+         to the next higher multiple of 10.
+        </para>
+
+        <para>
+         When using WAL Rate Limiting, appropriate values for
+         <varname>wal_rate_limit</> are usually quite small, perhaps
+         10 or 20 milliseconds.
+        </para>
+       </listitem>
+      </varlistentry>
+    </sect2>
+
     <sect2 id="runtime-config-resource-vacuum-cost">
      <title>Cost-based Vacuum Delay</title>
 
