@@ -9,6 +9,7 @@
 
 #include "postgres_fe.h"
 
+#include "mb/pg_wchar.h"
 #include "pg_upgrade.h"
 
 
@@ -393,6 +394,57 @@ set_locale_and_encoding(ClusterInfo *cluster)
 	PQfinish(conn);
 }
 
+/*
+ * equivalent_encoding()
+ *
+ * Best effort encoding comparison.  Return true only if the encodings both
+ * are correctly spelled and when they are equivalent.
+ */
+static bool
+equivalent_encoding(const char *chara, const char *charb)
+{
+	int			enca = pg_valid_server_encoding(chara);
+	int			encb = pg_valid_server_encoding(charb);
+
+	if (enca < 0 || encb < 0)
+		return false;
+
+	return (enca == encb);
+}
+
+/*
+ * equivalent_locale()
+ *
+ * Best effort locale comparison.  Return false if we are not 100% sure the
+ * locale is equivalent.
+ */
+static bool
+equivalent_locale(const char *loca, const char *locb)
+{
+	int			lencmp;
+	const char *chara = strrchr(loca, '.');
+	const char *charb = strrchr(locb, '.');
+
+	if (!chara || !charb)
+		/* not both locale strings do contain encoding part */
+		return (pg_strcasecmp(loca, locb) == 0);
+	chara++;
+	charb++;
+
+	if (!equivalent_encoding(chara, charb))
+		return false;
+
+	/*
+	 * We know the encoding part is equivalent.  So now compare only the
+	 * locale identifier (e.g. en_US part of en_US.utf8).
+	 */
+
+	lencmp = chara - loca;
+	if (lencmp != charb - locb)
+		return false;
+
+	return (pg_strncasecmp(loca, locb, lencmp) == 0);
+}
 
 /*
  * check_locale_and_encoding()
@@ -409,13 +461,13 @@ check_locale_and_encoding(ControlData *oldctrl,
 	 * They also often use inconsistent hyphenation, which we cannot fix, e.g.
 	 * UTF-8 vs. UTF8, so at least we display the mismatching values.
 	 */
-	if (pg_strcasecmp(oldctrl->lc_collate, newctrl->lc_collate) != 0)
+	if (!equivalent_locale(oldctrl->lc_collate, newctrl->lc_collate))
 		pg_fatal("lc_collate cluster values do not match:  old \"%s\", new \"%s\"\n",
 			   oldctrl->lc_collate, newctrl->lc_collate);
-	if (pg_strcasecmp(oldctrl->lc_ctype, newctrl->lc_ctype) != 0)
+	if (!equivalent_locale(oldctrl->lc_ctype, newctrl->lc_ctype))
 		pg_fatal("lc_ctype cluster values do not match:  old \"%s\", new \"%s\"\n",
 			   oldctrl->lc_ctype, newctrl->lc_ctype);
-	if (pg_strcasecmp(oldctrl->encoding, newctrl->encoding) != 0)
+	if (!equivalent_encoding(oldctrl->encoding, newctrl->encoding))
 		pg_fatal("encoding cluster values do not match:  old \"%s\", new \"%s\"\n",
 			   oldctrl->encoding, newctrl->encoding);
 }
