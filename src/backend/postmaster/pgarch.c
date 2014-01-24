@@ -36,6 +36,7 @@
 #include "access/xlog_internal.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
@@ -496,10 +497,17 @@ pgarch_ArchiverCopyLoop(void)
 			{
 				/* successful */
 				pgarch_archiveDone(xlog);
+
+				/* Tell the collector about the WAL file that we successfully archived */
+				pgstat_send_archiver(xlog, false);
+
 				break;			/* out of inner retry loop */
 			}
 			else
 			{
+				/* Tell the collector about the WAL file that we failed to archive */
+				pgstat_send_archiver(xlog, true);
+
 				if (++failures >= NUM_ARCHIVE_RETRIES)
 				{
 					ereport(WARNING,
