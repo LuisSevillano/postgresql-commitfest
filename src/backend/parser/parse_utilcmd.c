@@ -649,7 +649,7 @@ transformTableConstraint(CreateStmtContext *cxt, Constraint *constraint)
 /*
  * transformTableLikeClause
  *
- * Change the LIKE <srctable> portion of a CREATE TABLE statement into
+ * Change the LIKE <srctable> portion of a CREATE [FOREIGN] TABLE statement into
  * column definitions which recreate the user defined column portions of
  * <srctable>.
  */
@@ -668,12 +668,6 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 	setup_parser_errposition_callback(&pcbstate, cxt->pstate,
 									  table_like_clause->relation->location);
 
-	/* we could support LIKE in many cases, but worry about it another day */
-	if (cxt->isforeign)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("LIKE is not supported for creating foreign tables")));
-
 	relation = relation_openrv(table_like_clause->relation, AccessShareLock);
 
 	if (relation->rd_rel->relkind != RELKIND_RELATION &&
@@ -687,6 +681,12 @@ transformTableLikeClause(CreateStmtContext *cxt, TableLikeClause *table_like_cla
 						RelationGetRelationName(relation))));
 
 	cancel_parser_errposition_callback(&pcbstate);
+
+	/*
+	 * For foreign tables, ignore all but applicable options.
+	 */
+	if (cxt->isforeign)
+		table_like_clause->options &= CREATE_TABLE_LIKE_DEFAULTS | CREATE_TABLE_LIKE_COMMENTS;
 
 	/*
 	 * Check for privileges
