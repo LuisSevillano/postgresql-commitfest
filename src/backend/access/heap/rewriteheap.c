@@ -107,6 +107,8 @@
 #include "access/rewriteheap.h"
 #include "access/transam.h"
 #include "access/tuptoaster.h"
+#include "access/visibilitymap.h"
+#include "commands/vacuum.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
 #include "utils/memutils.h"
@@ -172,6 +174,7 @@ typedef OldToNewMappingData *OldToNewMapping;
 
 /* prototypes for internal functions */
 static void raw_heap_insert(RewriteState state, HeapTuple tup);
+static void update_page_vm(Relation relation, Page page, BlockNumber blkno);
 
 
 /*
@@ -281,6 +284,7 @@ end_heap_rewrite(RewriteState state)
 						true);
 		RelationOpenSmgr(state->rs_new_rel);
 
+		update_page_vm(state->rs_new_rel, state->rs_buffer, state->rs_blockno);
 		PageSetChecksumInplace(state->rs_buffer, state->rs_blockno);
 
 		smgrextend(state->rs_new_rel->rd_smgr, MAIN_FORKNUM, state->rs_blockno,
@@ -633,6 +637,7 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 			 */
 			RelationOpenSmgr(state->rs_new_rel);
 
+			update_page_vm(state->rs_new_rel, page, state->rs_blockno);
 			PageSetChecksumInplace(page, state->rs_blockno);
 
 			smgrextend(state->rs_new_rel->rd_smgr, MAIN_FORKNUM,
@@ -677,4 +682,24 @@ raw_heap_insert(RewriteState state, HeapTuple tup)
 	/* If heaptup is a private copy, release it. */
 	if (heaptup != tup)
 		heap_freetuple(heaptup);
+}
+
+static void
+update_page_vm(Relation relation, Page page, BlockNumber blkno)
+{
+	Buffer		vmbuffer = InvalidBuffer;
+	TransactionId visibility_cutoff_xid;
+
+	visibilitymap_pin(relation, blkno, &vmbuffer);
+	Assert(BufferIsValid(vmbuffer));
+
+	if (!visibilitymap_test(relation, blkno, &vmbuffer) &&
+		heap_page_is_all_visible(relation, InvalidBuffer, page,
+								 &visibility_cutoff_xid))
+	{
+		PageSetAllVisible(page);
+		visibilitymap_set(relation, blkno, InvalidBuffer,
+						  InvalidXLogRecPtr, vmbuffer, visibility_cutoff_xid);
+	}
+	ReleaseBuffer(vmbuffer);
 }

@@ -152,8 +152,6 @@ static void lazy_record_dead_tuple(LVRelStats *vacrelstats,
 					   ItemPointer itemptr);
 static bool lazy_tid_reaped(ItemPointer itemptr, void *state);
 static int	vac_cmp_itemptr(const void *left, const void *right);
-static bool heap_page_is_all_visible(Relation rel, Buffer buf,
-						 TransactionId *visibility_cutoff_xid);
 
 
 /*
@@ -1232,7 +1230,7 @@ lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
 	 * check if the page has become all-visible.
 	 */
 	if (!visibilitymap_test(onerel, blkno, vmbuffer) &&
-		heap_page_is_all_visible(onerel, buffer, &visibility_cutoff_xid))
+		heap_page_is_all_visible(onerel, buffer, NULL, &visibility_cutoff_xid))
 	{
 		Assert(BufferIsValid(*vmbuffer));
 		PageSetAllVisible(page);
@@ -1730,13 +1728,16 @@ vac_cmp_itemptr(const void *left, const void *right)
  * transactions. Also return the visibility_cutoff_xid which is the highest
  * xmin amongst the visible tuples.
  */
-static bool
-heap_page_is_all_visible(Relation rel, Buffer buf, TransactionId *visibility_cutoff_xid)
+bool
+heap_page_is_all_visible(Relation rel, Buffer buf, Page page,
+						 TransactionId *visibility_cutoff_xid)
 {
-	Page		page = BufferGetPage(buf);
 	OffsetNumber offnum,
 				maxoff;
 	bool		all_visible = true;
+
+	if (BufferIsValid(buf))
+		page = BufferGetPage(buf);
 
 	*visibility_cutoff_xid = InvalidTransactionId;
 
@@ -1758,7 +1759,9 @@ heap_page_is_all_visible(Relation rel, Buffer buf, TransactionId *visibility_cut
 		if (!ItemIdIsUsed(itemid) || ItemIdIsRedirected(itemid))
 			continue;
 
-		ItemPointerSet(&(tuple.t_self), BufferGetBlockNumber(buf), offnum);
+		/* XXX use 0 or real offset? */
+		ItemPointerSet(&(tuple.t_self), BufferIsValid(buf) ?
+					   BufferGetBlockNumber(buf) : 0, offnum);
 
 		/*
 		 * Dead line pointers can have index pointers pointing to them. So

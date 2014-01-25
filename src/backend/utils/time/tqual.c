@@ -108,6 +108,10 @@ static inline void
 SetHintBits(HeapTupleHeader tuple, Buffer buffer,
 			uint16 infomask, TransactionId xid)
 {
+	/* we might not have a buffer if we are doing raw_heap_insert() */
+	if (!BufferIsValid(buffer))
+		return;
+
 	if (TransactionIdIsValid(xid))
 	{
 		/* NB: xid must be known committed here! */

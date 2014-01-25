@@ -19,6 +19,7 @@
 #include "catalog/pg_type.h"
 #include "nodes/parsenodes.h"
 #include "storage/buf.h"
+#include "storage/bufpage.h"
 #include "storage/lock.h"
 #include "utils/relcache.h"
 
@@ -168,6 +169,8 @@ extern void vacuum_delay_point(void);
 /* in commands/vacuumlazy.c */
 extern void lazy_vacuum_rel(Relation onerel, VacuumStmt *vacstmt,
 				BufferAccessStrategy bstrategy);
+extern bool heap_page_is_all_visible(Relation rel, Buffer buf, Page page,
+						 TransactionId *visibility_cutoff_xid);
 
 /* in commands/analyze.c */
 extern void analyze_rel(Oid relid, VacuumStmt *vacstmt,

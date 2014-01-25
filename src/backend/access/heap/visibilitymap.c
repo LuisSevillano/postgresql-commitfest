@@ -257,7 +257,6 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 #endif
 
 	Assert(InRecovery || XLogRecPtrIsInvalid(recptr));
-	Assert(InRecovery || BufferIsValid(heapBuf));
 
 	/* Check that we have the right heap page pinned, if present */
 	if (BufferIsValid(heapBuf) && BufferGetBlockNumber(heapBuf) != heapBlk)
@@ -278,7 +277,7 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 		map[mapByte] |= (1 << mapBit);
 		MarkBufferDirty(vmBuf);
 
-		if (RelationNeedsWAL(rel))
+		if (RelationNeedsWAL(rel) && BufferIsValid(heapBuf))
 		{
 			if (XLogRecPtrIsInvalid(recptr))
 			{
