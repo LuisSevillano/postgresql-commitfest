@@ -865,7 +865,7 @@ ERROR:  could not serialize access due to read/write dependencies among transact
         <para>
          Acquired by <command>VACUUM</command> (without <option>FULL</option>),
          <command>ANALYZE</>, <command>CREATE INDEX CONCURRENTLY</>, and
-         some forms of <command>ALTER TABLE</command>.
+         <command>ALTER TABLE VALIDATE</command>.
         </para>
        </listitem>
       </varlistentry>
@@ -906,8 +906,8 @@ ERROR:  could not serialize access due to read/write dependencies among transact
         </para>
 
         <para>
-         This lock mode is not automatically acquired by any
-         <productname>PostgreSQL</productname> command.
+         Acquired by <command>ALTER TABLE</> for subcommand types that
+         affect write operations and by <command>CREATE TRIGGER</>.
         </para>
        </listitem>
       </varlistentry>
@@ -951,7 +951,7 @@ ERROR:  could not serialize access due to read/write dependencies among transact
         </para>
 
         <para>
-         Acquired by the <command>ALTER TABLE</>, <command>DROP TABLE</>,
+         Acquired by the <command>ALTER TABLE</> for rewriting, <command>DROP TABLE</>,
          <command>TRUNCATE</command>, <command>REINDEX</command>,
          <command>CLUSTER</command>, and <command>VACUUM FULL</command>
          commands.

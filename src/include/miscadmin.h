@@ -263,6 +263,7 @@ extern void PreventCommandDuringRecovery(const char *cmdname);
 /* in utils/misc/guc.c */
 extern int	trace_recovery_messages;
 extern int	trace_recovery(int trace_level);
+extern bool ddl_exclusive_locks;
 
 /*****************************************************************************
  *	  pdir.h --																 *

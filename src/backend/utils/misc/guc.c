@@ -1283,6 +1283,15 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"ddl_exclusive_locks", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
+			gettext_noop("Forces DDL statements to acquire AccessExclusiveLocks."),
+			NULL
+		},
+		&ddl_exclusive_locks,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"logging_collector", PGC_POSTMASTER, LOGGING_WHERE,
 			gettext_noop("Start a subprocess to capture stderr output and/or csvlogs into log files."),
 			NULL

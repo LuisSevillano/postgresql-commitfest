@@ -89,6 +89,7 @@
 #include "utils/tqual.h"
 #include "utils/typcache.h"
 
+bool	ddl_exclusive_locks = false;
 
 /*
  * ON COMMIT action list
@@ -2682,8 +2683,7 @@ AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode)
  * The caller must lock the relation, with an appropriate lock level
  * for the subcommands requested. Any subcommand that needs to rewrite
  * tuples in the table forces the whole command to be executed with
- * AccessExclusiveLock (actually, that is currently required always, but
- * we hope to relax it at some point).	We pass the lock level down
+ * AccessExclusiveLock.  We pass the lock level down
  * so that we can apply it recursively to inherited tables. Note that the
  * lock level we want as we recurse might well be higher than required for
  * that specific subcommand. So we pass down the overall lock requirement,
@@ -2750,32 +2750,13 @@ LOCKMODE
 AlterTableGetLockLevel(List *cmds)
 {
 	/*
-	 * Late in 9.1 dev cycle a number of issues were uncovered with access to
-	 * catalog relations, leading to the decision to re-enforce all DDL at
-	 * AccessExclusiveLock level by default.
-	 *
-	 * The issues are that there is a pervasive assumption in the code that
-	 * the catalogs will not be read unless an AccessExclusiveLock is held. If
-	 * that rule is relaxed, we must protect against a number of potential
-	 * effects - infrequent, but proven possible with test cases where
-	 * multiple DDL operations occur in a stream against frequently accessed
-	 * tables.
-	 *
-	 * 1. Catalog tables were read using SnapshotNow, which has a race bug that
-	 * allows a scan to return no valid rows even when one is present in the
-	 * case of a commit of a concurrent update of the catalog table.
-	 * SnapshotNow also ignores transactions in progress, so takes the latest
-	 * committed version without waiting for the latest changes.
-	 *
-	 * 2. Relcache needs to be internally consistent, so unless we lock the
-	 * definition during reads we have no way to guarantee that.
-	 *
-	 * 3. Catcache access isn't coordinated at all so refreshes can occur at
-	 * any time.
+	 * This only works if we read catalog tables using MVCC snapshots.
 	 */
-#ifdef REDUCED_ALTER_TABLE_LOCK_LEVELS
 	ListCell   *lcmd;
 	LOCKMODE	lockmode = ShareUpdateExclusiveLock;
+
+	if (ddl_exclusive_locks)
+		return (LOCKMODE) AccessExclusiveLock;
 
 	foreach(lcmd, cmds)
 	{
@@ -2807,6 +2788,7 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_SetTableSpace:		/* must rewrite heap */
 			case AT_DropNotNull:		/* may change some SQL plans */
 			case AT_SetNotNull:
+			case AT_SetStorage:			/* may add toast tables, see ATRewriteCatalogs() */
 			case AT_GenericOptions:
 			case AT_AlterColumnGenericOptions:
 				cmd_lockmode = AccessExclusiveLock;
@@ -2827,6 +2809,7 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_DisableTrig:
 			case AT_DisableTrigAll:
 			case AT_DisableTrigUser:
+			case AT_AlterConstraint:
 			case AT_AddIndex:	/* from ADD CONSTRAINT */
 			case AT_AddIndexConstraint:
 			case AT_ReplicaIdentity:
@@ -2909,8 +2892,6 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_ReplaceRelOptions:
 			case AT_SetOptions:
 			case AT_ResetOptions:
-			case AT_SetStorage:
-			case AT_AlterConstraint:
 			case AT_ValidateConstraint:
 				cmd_lockmode = ShareUpdateExclusiveLock;
 				break;
@@ -2927,9 +2908,6 @@ AlterTableGetLockLevel(List *cmds)
 		if (cmd_lockmode > lockmode)
 			lockmode = cmd_lockmode;
 	}
-#else
-	LOCKMODE	lockmode = AccessExclusiveLock;
-#endif
 
 	return lockmode;
 }
@@ -3256,6 +3234,13 @@ ATRewriteCatalogs(List **wqueue, LOCKMODE lockmode)
 			relation_close(rel, NoLock);
 		}
 	}
+
+	/*
+	 * If we think we might need to add/re-add toast tables then
+	 * we currently need to hold an AccessExclusiveLock.
+	 */
+	if (lockmode < AccessExclusiveLock)
+		return;
 
 	/* Check to see if a toast table must be added. */
 	foreach(ltab, *wqueue)
@@ -5863,7 +5848,7 @@ ATAddForeignKeyConstraint(AlteredTableInfo *tab, Relation rel,
 	 * table; trying to start with a lesser lock will just create a risk of
 	 * deadlock.)
 	 */
-	pkrel = heap_openrv(fkconstraint->pktable, AccessExclusiveLock);
+	pkrel = heap_openrv(fkconstraint->pktable, ShareUpdateExclusiveLock);
 
 	/*
 	 * Validity checks (permission checks wait till we have the column

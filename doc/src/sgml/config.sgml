@@ -6045,6 +6045,22 @@ dynamic_library_path = 'C:\tools\postgresql;H:\my_project\lib;$libdir'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-ddl-exclusive-locks" xreflabel="ddl_exclusive_locks">
+      <term><varname>ddl_exclusive_locks</varname> (<type>boolean</type>)</term>
+      <indexterm>
+       <primary><varname>ddl_exclusive_locks</> configuration parameter</primary>
+      </indexterm>
+      <listitem>
+       <para>
+        This controls whether <literal>DDL</> commands will be forced
+        to use <literal>AccessExclusiveLock</> while executing.
+        The parameter is <literal>off</> by default; in
+        <productname>PostgreSQL</> 9.3 and earlier, it was on by
+        default.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-escape-string-warning" xreflabel="escape_string_warning">
       <term><varname>escape_string_warning</varname> (<type>boolean</type>)</term>
       <indexterm><primary>strings</><secondary>escape warning</></>

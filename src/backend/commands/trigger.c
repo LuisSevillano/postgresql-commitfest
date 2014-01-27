@@ -146,8 +146,12 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	Oid			constrrelid = InvalidOid;
 	ObjectAddress myself,
 				referenced;
+	LOCKMODE	lockmode = ShareUpdateExclusiveLock;
 
-	rel = heap_openrv(stmt->relation, AccessExclusiveLock);
+	if (ddl_exclusive_locks)
+		lockmode = AccessExclusiveLock;
+
+	rel = heap_openrv(stmt->relation, lockmode);
 
 	/*
 	 * Triggers must be on tables or views, and there are additional
@@ -482,8 +486,8 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	 * can skip this for internally generated triggers, since the name
 	 * modification above should be sufficient.
 	 *
-	 * NOTE that this is cool only because we have AccessExclusiveLock on the
-	 * relation, so the trigger set won't be changing underneath us.
+	 * NOTE that this is cool only because we have a sufficient lock on the
+	 * relation to ensure the trigger set won't be changing underneath us.
 	 */
 	if (!isInternal)
 	{
@@ -1036,6 +1040,10 @@ RemoveTriggerById(Oid trigOid)
 	HeapTuple	tup;
 	Oid			relid;
 	Relation	rel;
+	LOCKMODE	lockmode = ShareUpdateExclusiveLock;
+
+	if (ddl_exclusive_locks)
+		lockmode = AccessExclusiveLock;
 
 	tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
 
@@ -1059,7 +1067,7 @@ RemoveTriggerById(Oid trigOid)
 	 */
 	relid = ((Form_pg_trigger) GETSTRUCT(tup))->tgrelid;
 
-	rel = heap_open(relid, AccessExclusiveLock);
+	rel = heap_open(relid, lockmode);
 
 	if (rel->rd_rel->relkind != RELKIND_RELATION &&
 		rel->rd_rel->relkind != RELKIND_VIEW)
@@ -1225,8 +1233,8 @@ renametrig(RenameStmt *stmt)
 	 * on tgrelid/tgname would complain anyway) and to ensure a trigger does
 	 * exist with oldname.
 	 *
-	 * NOTE that this is cool only because we have AccessExclusiveLock on the
-	 * relation, so the trigger set won't be changing underneath us.
+	 * NOTE that this is cool only because we have a sufficient lock on the
+	 * relation to ensure that the trigger set won't be changing underneath us.
 	 */
 	tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
 
