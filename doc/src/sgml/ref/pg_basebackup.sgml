@@ -138,6 +138,18 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-T <replaceable class="parameter">olddir=newdir</replaceable></option></term>
+      <term><option>--tablespace-mapping=<replaceable class="parameter">olddir=newdir</replaceable></option></term>
+      <listitem>
+       <para>
+        Relocates the tablespace(s) in directory <replaceable>olddir</replaceable>
+        to <replaceable>newdir</replaceable>. This options can be specified multiple times
+        for multiple tablespaces.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-F <replaceable class="parameter">format</replaceable></option></term>
       <term><option>--format=<replaceable class="parameter">format</replaceable></option></term>
       <listitem>
@@ -530,7 +542,7 @@ PostgreSQL documentation
   <para>
    The way <productname>PostgreSQL</productname> manages tablespaces, the path
    for all additional tablespaces must be identical whenever a backup is
-   restored. The main data directory, however, is relocatable to any location.
+   restored, if <replaceable>--tablespace-mapping</replaceable> isn't specified.
   </para>
 
   <para>
@@ -569,6 +581,14 @@ PostgreSQL documentation
 </screen>
    (This command will fail if there are multiple tablespaces in the
    database.)
+  </para>
+
+  <para>
+   To create a backup of a two-tablespace local database where tablespace
+   <literal>/opt/ts</literal> is relocated to <literal>./backup/archive</literal>
+<screen>
+<prompt>$</prompt> <userinput>pg_basebackup -D $(pwd)/backup/data -T /opt/ts:$(pwd)/backup/archive</userinput>
+</screen>
   </para>
  </refsect1>
 

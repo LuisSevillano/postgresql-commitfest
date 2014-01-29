@@ -33,8 +33,27 @@
 #include "streamutil.h"
 
 
+#define atooid(x)  ((Oid) strtoul((x), NULL, 10))
+
+/* Char used to separate olddir and newdir for tablespace */
+static const char TBLSPC_SEP = '=';
+
+typedef struct TablespaceListCell
+{
+	struct TablespaceListCell *next;
+	char old_dir[MAXPGPATH];
+	char new_dir[MAXPGPATH];
+} TablespaceListCell;
+
+typedef struct TablespaceList
+{
+	TablespaceListCell *head;
+	TablespaceListCell *tail;
+} TablespaceList;
+
 /* Global options */
 static char *basedir = NULL;
+static TablespaceList tablespace_dirs = {NULL, NULL};
 static char *xlog_dir = "";
 static char	format = 'p';		/* p(lain)/t(ar) */
 static char *label = "pg_basebackup base backup";
@@ -86,6 +105,74 @@ static void BaseBackup(void);
 static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline,
 					 bool segment_finished);
 
+static const char *get_tablespace_dir(const char *dir);
+static void update_tablespace_symlink(Oid oid, const char *old_dir);
+static bool tablespace_list_append(char *arg);
+
+/*
+ * Split tablespace argument into old_dir and new_dir, this accounts for
+ * directory name containing a colon.
+ */
+static bool
+tablespace_list_append(char *arg)
+{
+	TablespaceListCell *cell = (TablespaceListCell *) pg_malloc0(sizeof(TablespaceListCell));
+	char		*dst = cell->old_dir;
+	const char	*dst_head = dst;
+	const char	*arg_head = arg;
+
+	cell->next = NULL;
+
+	for (; *arg; arg++)
+	{
+		/* Check for overflow */
+		if (dst - dst_head >= MAXPGPATH)
+		{
+			fprintf(stderr, _("%s: directory name too long (max %d bytes)\n"),
+					progname, MAXPGPATH);
+			exit(1);
+		}
+
+		/* Split on colon not trailing a slash */
+		if (*arg == '\\' && *(arg + 1) == TBLSPC_SEP)
+			;
+		else if (*arg != TBLSPC_SEP || (arg != arg_head && *(arg - 1) == '\\'))
+			*dst++ = *arg;
+		else if (!*cell->old_dir || *cell->new_dir)
+			return false;
+		/* Found directory separator, switch to new directory */
+		else
+		{
+			dst_head = dst = cell->new_dir;
+
+			/* Add cwd if this is a relative path */
+			if (*(arg + 1) != '/')
+			{
+				if (!getcwd(dst, MAXPGPATH))
+				{
+					fprintf(stderr, _("%s: could not identify current directory: %s\n"),
+							progname, strerror(errno));
+					exit(1);
+				}
+				dst += strlen(dst);
+				*dst++ = '/';
+			}
+		}
+	}
+
+	if (!(*cell->old_dir && *cell->new_dir))
+		return false;
+
+	if (tablespace_dirs.tail)
+		tablespace_dirs.tail->next = cell;
+	else
+		tablespace_dirs.head = cell;
+	tablespace_dirs.tail = cell;
+
+	return true;
+}
+
+
 #ifdef HAVE_LIBZ
 static const char *
 get_gz_error(gzFile gzf)
@@ -113,6 +200,8 @@ usage(void)
 	printf(_("  -F, --format=p|t       output format (plain (default), tar)\n"));
 	printf(_("  -R, --write-recovery-conf\n"
 			 "                         write recovery.conf after backup\n"));
+	printf(_("  -T, --tablespace-mapping=OLDDIR=NEWDIR\n"
+			 "                         relocate tablespace matching olddir to newdir\n"));
 	printf(_("  -x, --xlog             include required WAL files in backup (fetch mode)\n"));
 	printf(_("  -X, --xlog-method=fetch|stream\n"
 			 "                         include required WAL files with specified method\n"));
@@ -861,14 +950,59 @@ ReceiveTarFile(PGconn *conn, PGresult *res, int rownum)
 }
 
 /*
+ * Retrieve tablespace path, either relocated or original depending on
+ * whether -T old_dir=new_dir was passed or not.
+ */
+static const char *
+get_tablespace_dir(const char *dir)
+{
+	TablespaceListCell *cell;
+
+	for (cell = tablespace_dirs.head; cell; cell = cell->next)
+		if (strcmp(dir, cell->old_dir) == 0)
+			return cell->new_dir;
+		else if (strstr(dir, cell->old_dir) != NULL)
+			return psprintf("%s/%s",
+							cell->new_dir,
+							dir + strlen(cell->old_dir) + 1);
+
+	return dir;
+}
+
+/*
+ * Update symlinks to reflect relocated tablespace, only applied if
+ * tablespace isn't in its original location.
+ */
+static void
+update_tablespace_symlink(Oid oid, const char *old_dir)
+{
+	const char *new_dir = get_tablespace_dir(old_dir);
+	if (strcmp(old_dir, new_dir) != 0)
+	{
+		char *linkloc = psprintf("%s/pg_tblspc/%d", basedir, oid);
+		if (unlink(linkloc) < 0 && errno != ENOENT)
+		{
+			fprintf(stderr, _("%s: could not remove symbolic link \"%s\": %s"),
+					progname, linkloc, strerror(errno));
+			disconnect_and_exit(1);
+		}
+		if (symlink(new_dir, linkloc) < 0)
+		{
+			fprintf(stderr, _("%s: could not create symbolic link \"%s\": %s"),
+					progname, linkloc, strerror(errno));
+			disconnect_and_exit(1);
+		}
+	}
+}
+
+/*
  * Receive a tar format stream from the connection to the server, and unpack
  * the contents of it into a directory. Only files, directories and
  * symlinks are supported, no other kinds of special files.
  *
  * If the data is for the main data directory, it will be restored in the
  * specified directory. If it's for another tablespace, it will be restored
- * in the original directory, since relocation of tablespaces is not
- * supported.
+ * in the original directory, if tablespace relocation is not enabled.
  */
 static void
 ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
@@ -884,7 +1018,7 @@ ReceiveAndUnpackTarFile(PGconn *conn, PGresult *res, int rownum)
 	if (basetablespace)
 		strcpy(current_path, basedir);
 	else
-		strcpy(current_path, PQgetvalue(res, rownum, 1));
+		strcpy(current_path, get_tablespace_dir(PQgetvalue(res, rownum, 1)));
 
 	/*
 	 * Get the COPY data
@@ -1465,7 +1599,10 @@ BaseBackup(void)
 		 * we do anything anyway.
 		 */
 		if (format == 'p' && !PQgetisnull(res, i, 1))
-			verify_dir_is_empty_or_create(PQgetvalue(res, i, 1));
+		{
+			char *path = (char *) get_tablespace_dir(PQgetvalue(res, i, 1));
+			verify_dir_is_empty_or_create(path);
+		}
 	}
 
 	/*
@@ -1507,6 +1644,22 @@ BaseBackup(void)
 		progress_report(PQntuples(res), NULL);
 		fprintf(stderr, "\n");	/* Need to move to next line */
 	}
+
+	if (format == 'p' && tablespace_dirs.head != NULL)
+	{
+#ifdef HAVE_SYMLINK
+		for (i = 0; i < PQntuples(res); i++)
+		{
+			Oid tblspc_oid = atooid(PQgetvalue(res, i, 0));
+			if (tblspc_oid)
+				update_tablespace_symlink(tblspc_oid, PQgetvalue(res, i, 1));
+		}
+#else
+		fprintf(stderr, _("%s: tablespace relocation is not supported on this platform\n"),
+				progname);
+#endif
+	}
+
 	PQclear(res);
 
 	/*
@@ -1658,6 +1811,7 @@ main(int argc, char **argv)
 		{"format", required_argument, NULL, 'F'},
 		{"checkpoint", required_argument, NULL, 'c'},
 		{"write-recovery-conf", no_argument, NULL, 'R'},
+		{"tablespace-mapping", required_argument, NULL, 'T'},
 		{"xlog", no_argument, NULL, 'x'},
 		{"xlog-method", required_argument, NULL, 'X'},
 		{"gzip", no_argument, NULL, 'z'},
@@ -1697,7 +1851,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "D:F:RxX:l:zZ:d:c:h:p:U:s:wWvP",
+	while ((c = getopt_long(argc, argv, "D:F:RT:xX:l:zZ:d:c:h:p:U:s:wWvP",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -1720,6 +1874,15 @@ main(int argc, char **argv)
 				break;
 			case 'R':
 				writerecoveryconf = true;
+				break;
+			case 'T':
+				if (!tablespace_list_append(optarg))
+				{
+					fprintf(stderr,
+							_("%s: invalid tablespace mapping format \"%s\", must be \"olddir=newdir\"\n"),
+							progname, optarg);
+					exit(1);
+				}
 				break;
 			case 'x':
 				if (includewal)
