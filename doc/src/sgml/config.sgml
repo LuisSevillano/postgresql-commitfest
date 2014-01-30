@@ -1128,10 +1128,7 @@ include 'filename'
         The use of huge TLB pages results in smaller page tables and
         less CPU time spent on memory management, increasing performance. For
         more details, see
-        <ulink url="https://wiki.debian.org/Hugepages">the Debian wiki</ulink>.
-        Remember that you will need at least shared_buffers / huge page size +
-        1 huge TLB pages. So for example for a system with 6GB shared buffers
-        and a hugepage size of 2kb of you will need at least 3156 huge pages.
+        <link linkend="linux-huge-tlb-pages">Linux huge TLB pages</link>.
        </para>
 
        <para>
