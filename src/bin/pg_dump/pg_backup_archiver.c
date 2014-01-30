@@ -413,8 +413,84 @@ RestoreArchive(Archive *AHX)
 				/* Select owner and schema as necessary */
 				_becomeOwner(AH, te);
 				_selectOutputSchema(AH, te->namespace);
-				/* Drop it */
-				ahprintf(AH, "%s", te->dropStmt);
+
+				if (*te->dropStmt != '\0')
+				{
+					/* Inject IF EXISTS clause to DROP part when it is required. */
+					if (ropt->if_exists)
+					{
+						char buffer[40];
+						char *mark;
+						char *dropStmt = te->dropStmt;
+						PQExpBuffer ftStmt = createPQExpBuffer();
+
+						/* ALTER TABLE should be enahnced to ALTER TABLE IF EXISTS */
+						if (strncmp(dropStmt, "ALTER TABLE", 11) == 0)
+						{
+							/*
+							 * Prepare fault tolerant statement, but
+							 * ensure unique IF EXISTS option.
+							 */
+							if (strncmp(dropStmt + 11, " IF EXISTS", 10) != 0)
+							{
+								appendPQExpBuffer(ftStmt, "ALTER TABLE IF EXISTS");
+								dropStmt = dropStmt + 11;
+							}
+						}
+
+						/*
+						 * A content of te->desc is usually substring of DROP STATEMENT
+						 * with one related exception - CONSTRAINTs.
+						 *
+						 * Independent to previous sentence - ALTER TABLE ALTER COLUMN
+						 * DROP DEFAULT doesn't support IF EXISTS - and therefore it
+						 * should not be injected.
+						 */
+						if (strcmp(te->desc, "DEFAULT") != 0)
+						{
+							if (strcmp(te->desc, "CONSTRAINT") == 0 ||
+									 strcmp(te->desc, "CHECK CONSTRAINT") == 0 ||
+									 strcmp(te->desc, "FK CONSTRAINT") == 0)
+								strcpy(buffer, "DROP CONSTRAINT");
+							else
+								snprintf(buffer, sizeof(buffer), "DROP %s",
+													 te->desc);
+
+							mark = strstr(dropStmt, buffer);
+						}
+						else
+							mark = NULL;
+
+						if (mark != NULL)
+						{
+							size_t l = strlen(buffer);
+
+							/*
+							 * Insert IF EXISTS clause when it is not
+							 * used yet.
+							 */
+							if (strncmp(mark + l, " IF EXISTS", 10) != 0)
+							{
+								*mark = '\0';
+
+								appendPQExpBuffer(ftStmt, "%s%s IF EXISTS%s",
+													    dropStmt,
+													    buffer,
+													    mark + l);
+							}
+							else
+								appendPQExpBuffer(ftStmt, "%s", dropStmt);
+						}
+						else
+							appendPQExpBuffer(ftStmt, "%s", dropStmt);
+
+						ahprintf(AH, "%s", ftStmt->data);
+
+						destroyPQExpBuffer(ftStmt);
+					}
+					else
+						ahprintf(AH, "%s", te->dropStmt);
+				}
 			}
 		}
 
@@ -2942,9 +3018,39 @@ _getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
 		strcmp(type, "OPERATOR CLASS") == 0 ||
 		strcmp(type, "OPERATOR FAMILY") == 0)
 	{
-		/* Chop "DROP " off the front and make a modifiable copy */
-		char	   *first = pg_strdup(te->dropStmt + 5);
-		char	   *last;
+		char	    *first;
+		char	    *last;
+
+		/*
+		 * Object description is based on dropStmt statement which may have
+		 * IF EXISTS clause.  Thus we need to update an offset such that it
+		 * won't be included in the object description.
+		 */
+		if (strstr(te->dropStmt, "IF EXISTS") != NULL)
+		{
+			char buffer[40];
+			size_t   l;
+
+			/* Be sure, so IF EXISTS is used as DROP stmt option. */
+			snprintf(buffer, sizeof(buffer), "DROP %s IF EXISTS", type);
+
+			l = strlen(buffer);
+
+			if (strncmp(te->dropStmt, buffer, l) == 0)
+			{
+				/* append command type to target type */
+				appendPQExpBufferStr(buf, type);
+
+				/* skip first n chars, and create a modifiable copy */
+				first = pg_strdup(te->dropStmt + l);
+			}
+			else
+				/* DROP IF EXISTS pattern is not applicable on dropStmt */
+				first = pg_strdup(te->dropStmt + 5);
+		}
+		else
+			/* IF EXISTS clause was not used, simple solution */
+			first = pg_strdup(te->dropStmt + 5);
 
 		/* point to last character in string */
 		last = first + strlen(first) - 1;

@@ -490,6 +490,16 @@
      </varlistentry>
 
      <varlistentry>
+      <term><option>--if-exists</option></term>
+      <listitem>
+       <para>
+        It uses conditional commands (with <literal>IF EXISTS</literal>
+        clause) for cleaning database schema.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--no-data-for-failed-tables</option></term>
       <listitem>
        <para>
