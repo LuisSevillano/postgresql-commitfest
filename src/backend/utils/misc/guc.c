@@ -3000,7 +3000,7 @@ static struct config_string ConfigureNamesString[] =
 			NULL
 		},
 		&event_source,
-		"PostgreSQL",
+		DEFAULT_EVENT_SOURCE,
 		NULL, NULL, NULL
 	},
 

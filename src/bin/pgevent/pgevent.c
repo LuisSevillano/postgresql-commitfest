@@ -12,6 +12,8 @@
  */
 
 
+#include "postgres_fe.h"
+
 #include <windows.h>
 #include <olectl.h>
 #include <string.h>
@@ -26,7 +28,7 @@ HANDLE		g_module = NULL;	/* hModule of DLL */
  * The maximum length of a registry key is 255 characters.
  * http://msdn.microsoft.com/en-us/library/ms724872(v=vs.85).aspx
  */
-char		event_source[256] = "PostgreSQL";
+char		event_source[256] = DEFAULT_EVENT_SOURCE;
 
 /* Prototypes */
 HRESULT		DllInstall(BOOL bInstall, LPCWSTR pszCmdLine);
@@ -54,11 +56,12 @@ DllInstall(BOOL bInstall,
 	 *
 	 * This strange behavior forces us to specify -n (i.e. "regsvr32 /n /i").
 	 * Without -n, DllRegisterServer called before DllInstall would mistakenly
-	 * overwrite the default "PostgreSQL" event source registration.
+	 * overwrite the default event source registration.
 	 */
 	if (bInstall)
-		DllRegisterServer();
-	return S_OK;
+		return DllRegisterServer();
+	else
+		return S_OK;
 }
 
 /*
@@ -72,6 +75,7 @@ DllRegisterServer(void)
 	DWORD		data;
 	char		buffer[_MAX_PATH];
 	char		key_name[400];
+	char		message[1024];
 
 	/* Set the name of DLL full path name. */
 	if (!GetModuleFileName((HMODULE) g_module, buffer, sizeof(buffer)))
@@ -87,9 +91,18 @@ DllRegisterServer(void)
 	_snprintf(key_name, sizeof(key_name),
 			"SYSTEM\\CurrentControlSet\\Services\\EventLog\\Application\\%s",
 			  event_source);
-	if (RegCreateKey(HKEY_LOCAL_MACHINE, key_name, &key))
+	if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, key_name, 0, NULL, 0, KEY_WRITE,
+		NULL, &key, &data))
 	{
 		MessageBox(NULL, "Could not create the registry key.", "PostgreSQL error", MB_OK | MB_ICONSTOP);
+		return SELFREG_E_TYPELIB;
+	}
+	else if (data == REG_OPENED_EXISTING_KEY)
+	{
+		RegCloseKey(key);
+		_snprintf(message, sizeof(message),
+				"Event source \"%s\" is already registered.", event_source);
+		MessageBox(NULL, message, "PostgreSQL error", MB_OK | MB_ICONSTOP);
 		return SELFREG_E_TYPELIB;
 	}
 

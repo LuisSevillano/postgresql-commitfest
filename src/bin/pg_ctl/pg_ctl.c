@@ -103,6 +103,7 @@ static char recovery_file[MAXPGPATH];
 static char promote_file[MAXPGPATH];
 
 #if defined(WIN32) || defined(__CYGWIN__)
+static char event_source[256];
 static DWORD pgctl_start_type = SERVICE_AUTO_START;
 static SERVICE_STATUS status;
 static SERVICE_STATUS_HANDLE hStatus = (SERVICE_STATUS_HANDLE) 0;
@@ -132,6 +133,7 @@ static void do_status(void);
 static void do_promote(void);
 static void do_kill(pgpid_t pid);
 static void print_msg(const char *msg);
+static void get_config_value(const char *name, char *buf, int buf_size);
 static void adjust_data_dir(void);
 
 #if defined(WIN32) || defined(__CYGWIN__)
@@ -176,7 +178,8 @@ write_eventlog(int level, const char *line)
 
 	if (evtHandle == INVALID_HANDLE_VALUE)
 	{
-		evtHandle = RegisterEventSource(NULL, "PostgreSQL");
+		evtHandle = RegisterEventSource(NULL,
+						*event_source ? event_source : DEFAULT_EVENT_SOURCE);
 		if (evtHandle == NULL)
 		{
 			evtHandle = INVALID_HANDLE_VALUE;
@@ -1922,6 +1925,38 @@ set_starttype(char *starttypeopt)
 }
 #endif
 
+static void
+get_config_value(const char *name, char *buf, int buf_size)
+{
+	char		cmd[MAXPGPATH],
+			   *my_exec_path;
+	FILE	   *fd;
+
+	/* we use a private my_exec_path to avoid interfering with later uses */
+	if (exec_path == NULL)
+		my_exec_path = find_other_exec_or_die(argv0, "postgres", PG_BACKEND_VERSIONSTR);
+	else
+		my_exec_path = pg_strdup(exec_path);
+
+	snprintf(cmd, MAXPGPATH, SYSTEMQUOTE "\"%s\" %s%s -C %s" SYSTEMQUOTE,
+			 my_exec_path, pgdata_opt ? pgdata_opt : "", post_opts ?
+			 post_opts : "", name);
+
+	fd = popen(cmd, "r");
+	if (fd == NULL || fgets(buf, buf_size, fd) == NULL)
+	{
+		write_stderr(_("%s: could not execute command \"%s\": %s\n"),
+					 progname, cmd, strerror(errno));
+		exit(1);
+	}
+	pclose(fd);
+	free(my_exec_path);
+
+	/* Remove trailing newline */
+	if (strchr(buf, '\n') != NULL)
+		*strchr(buf, '\n') = '\0';
+}
+
 /*
  * adjust_data_dir
  *
@@ -1930,9 +1965,7 @@ set_starttype(char *starttypeopt)
 static void
 adjust_data_dir(void)
 {
-	char		cmd[MAXPGPATH],
-				filename[MAXPGPATH],
-			   *my_exec_path;
+	char		filename[MAXPGPATH];
 	FILE	   *fd;
 
 	/* do nothing if we're working without knowledge of data dir */
@@ -1954,29 +1987,7 @@ adjust_data_dir(void)
 	}
 
 	/* Must be a configuration directory, so find the data directory */
-
-	/* we use a private my_exec_path to avoid interfering with later uses */
-	if (exec_path == NULL)
-		my_exec_path = find_other_exec_or_die(argv0, "postgres", PG_BACKEND_VERSIONSTR);
-	else
-		my_exec_path = pg_strdup(exec_path);
-
-	snprintf(cmd, MAXPGPATH, SYSTEMQUOTE "\"%s\" %s%s -C data_directory" SYSTEMQUOTE,
-			 my_exec_path, pgdata_opt ? pgdata_opt : "", post_opts ?
-			 post_opts : "");
-
-	fd = popen(cmd, "r");
-	if (fd == NULL || fgets(filename, sizeof(filename), fd) == NULL)
-	{
-		write_stderr(_("%s: could not determine the data directory using command \"%s\"\n"), progname, cmd);
-		exit(1);
-	}
-	pclose(fd);
-	free(my_exec_path);
-
-	/* Remove trailing newline */
-	if (strchr(filename, '\n') != NULL)
-		*strchr(filename, '\n') = '\0';
+	get_config_value("data_directory", filename, sizeof(filename));
 
 	free(pg_data);
 	pg_data = pg_strdup(filename);
@@ -2213,6 +2224,11 @@ main(int argc, char **argv)
 
 	/* -D might point at config-only directory; if so find the real PGDATA */
 	adjust_data_dir();
+
+#if defined(WIN32) || defined(__CYGWIN__)
+	/* Get event source from postgresql.conf for eventlog output */
+	get_config_value("event_source", event_source, sizeof(event_source));
+#endif
 
 	/* Complain if -D needed and not provided */
 	if (pg_config == NULL &&
