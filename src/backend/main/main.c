@@ -58,6 +58,11 @@ static void check_root(const char *progname);
 int
 main(int argc, char *argv[])
 {
+	bool		check_if_admin = true;
+#ifdef WIN32
+	int			i;
+#endif
+
 	progname = get_progname(argv[0]);
 
 	/*
@@ -168,10 +173,26 @@ main(int argc, char *argv[])
 		}
 	}
 
+#ifdef WIN32
+
+	/*
+	 * Allow execution of PostgreSQL by a user with administrative permissions
+	 * when -C, --describe-config, or --single is specified. The reasons are:
+	 * 1)With these switches, there is no fear of process hijack. 2)The DBA
+	 * wants to use them. 3)pg_ctl runs "postgres -C".
+	 */
+	for (i = 1; i < argc; i++)
+		if (strncmp(argv[i], "-C", 2) == 0 ||
+			strcmp(argv[i], "--describe-config") == 0 ||
+			strcmp(argv[i], "--single") == 0)
+			check_if_admin = false;
+#endif
+
 	/*
 	 * Make sure we are not running as root.
 	 */
-	check_root(progname);
+	if (check_if_admin)
+		check_root(progname);
 
 	/*
 	 * Dispatch to one of various subprograms depending on first argument.
