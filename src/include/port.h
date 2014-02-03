@@ -59,6 +59,7 @@ extern void get_html_path(const char *my_exec_path, char *ret_path);
 extern void get_man_path(const char *my_exec_path, char *ret_path);
 extern bool get_home_path(char *ret_path);
 extern void get_parent_directory(char *path);
+extern int  get_absolute_path(char *inpath, char *retpath);
 
 /* port/dirmod.c */
 extern char **pgfnames(const char *path);

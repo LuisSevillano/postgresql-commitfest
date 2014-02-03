@@ -1326,7 +1326,19 @@ pgwin32_CommandLine(bool registration)
 						  register_servicename);
 
 	if (pg_config)
-		appendPQExpBuffer(cmdLine, " -D \"%s\"", pg_config);
+	{
+		char		dataDir[MAXPGPATH];
+
+		if (get_absolute_path(pg_config, dataDir) != 0)
+		{
+			write_stderr(_("%s: could not identify current directory\n"),
+						 progname);
+			exit(1);
+		}
+
+		make_native_path(dataDir);
+		appendPQExpBuffer(cmdLine, " -D \"%s\"", dataDir);
+	}
 
 	if (registration && do_wait)
 		appendPQExpBuffer(cmdLine, " -w");

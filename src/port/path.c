@@ -757,3 +757,33 @@ trim_trailing_separator(char *path)
 		for (p--; p > path && IS_DIR_SEP(*p); p--)
 			*p = '\0';
 }
+
+/*
+ *	get_absolute_path
+ *
+ *	Get an absolute path to a given path.
+ *	inpath is the input path for which absolute path required.
+ *	retpath is the output area (must be of size MAXPGPATH)
+ *	Returns 0 if OK, -1 if error.
+ */
+int
+get_absolute_path(char *inpath, char *retpath)
+{
+	/*
+	 * Check if it is already absolute path.
+	 */
+	if (is_absolute_path(inpath))
+	{
+		strlcpy(retpath, inpath, MAXPGPATH);
+	}
+	else
+	{
+		if (!getcwd(retpath, MAXPGPATH))
+			return -1;
+
+		join_path_components(retpath, retpath, inpath);
+		canonicalize_path(retpath);
+	}
+
+	return 0;
+}
