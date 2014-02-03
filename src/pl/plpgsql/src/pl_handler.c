@@ -25,6 +25,10 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+
+static bool plpgsql_warnings_check_hook(char **newvalue, void **extra, GucSource source);
+static void plpgsql_warnings_assign_hook(const char *newvalue, void *extra);
+
 PG_MODULE_MAGIC;
 
 /* Custom GUC variable */
@@ -39,9 +43,33 @@ int			plpgsql_variable_conflict = PLPGSQL_RESOLVE_ERROR;
 
 bool		plpgsql_print_strict_params = false;
 
+char	   *plpgsql_warnings_list = NULL;
+bool		plpgsql_warnings;
+bool		plpgsql_warnings_as_errors;
+
 /* Hook for plugins */
 PLpgSQL_plugin **plugin_ptr = NULL;
 
+
+static bool
+plpgsql_warnings_check_hook(char **newvalue, void **extra, GucSource source)
+{
+	if (strcmp(*newvalue, "all") == 0 ||
+		strcmp(*newvalue, "shadow") == 0 ||
+		strcmp(*newvalue, "none") == 0)
+		return true;
+	return false;
+}
+
+static void
+plpgsql_warnings_assign_hook(const char *newvalue, void *extra)
+{
+	if (strcmp(newvalue, "all") == 0 ||
+		strcmp(newvalue, "shadow") == 0)
+		plpgsql_warnings = true;
+	else
+		plpgsql_warnings = false;
+}
 
 /*
  * _PG_init()			- library load-time initialization
@@ -72,6 +100,24 @@ _PG_init(void)
 							 gettext_noop("Print information about parameters in the DETAIL part of the error messages generated on INTO .. STRICT failures."),
 							 NULL,
 							 &plpgsql_print_strict_params,
+							 false,
+							 PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("plpgsql.warnings",
+							   gettext_noop("List of programming constructs which should produce a warning."),
+							   NULL,
+							   &plpgsql_warnings_list,
+							   "none",
+							   PGC_USERSET, 0,
+							   plpgsql_warnings_check_hook,
+							   plpgsql_warnings_assign_hook,
+							   NULL);
+
+	DefineCustomBoolVariable("plpgsql.warnings_as_errors",
+							 gettext_noop("If set, attempting to compile a function which would emit a warning will raise an error instead."),
+							 NULL,
+							 &plpgsql_warnings_as_errors,
 							 false,
 							 PGC_USERSET, 0,
 							 NULL, NULL, NULL);

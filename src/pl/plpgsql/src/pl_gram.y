@@ -727,6 +727,20 @@ decl_varname	: T_WORD
 											  $1.ident, NULL, NULL,
 											  NULL) != NULL)
 							yyerror("duplicate declaration");
+
+						if (plpgsql_curr_compile->warnings)
+						{
+							PLpgSQL_nsitem *nsi;
+							nsi = plpgsql_ns_lookup(plpgsql_ns_top(), false,
+													$1.ident, NULL, NULL, NULL);
+							if (nsi != NULL)
+								ereport(plpgsql_curr_compile->warnings_as_errors ? ERROR : WARNING,
+										(errcode(ERRCODE_DUPLICATE_ALIAS),
+										 errmsg("variable \"%s\" shadows a previously defined variable",
+												$1.ident),
+										 parser_errposition(@1)));
+						}
+
 					}
 				| unreserved_keyword
 					{
@@ -740,6 +754,20 @@ decl_varname	: T_WORD
 											  $1, NULL, NULL,
 											  NULL) != NULL)
 							yyerror("duplicate declaration");
+
+						if (plpgsql_curr_compile->warnings)
+						{
+							PLpgSQL_nsitem *nsi;
+							nsi = plpgsql_ns_lookup(plpgsql_ns_top(), false,
+													$1, NULL, NULL, NULL);
+							if (nsi != NULL)
+								ereport(plpgsql_curr_compile->warnings_as_errors ? ERROR : WARNING,
+										(errcode(ERRCODE_DUPLICATE_ALIAS),
+										 errmsg("variable \"%s\" shadows a previously defined variable",
+												$1),
+										 parser_errposition(@1)));
+						}
+
 					}
 				;
 

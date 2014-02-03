@@ -3208,6 +3208,79 @@ select footest();
 ERROR:  query returned more than one row
 DETAIL:  parameters: p1 = '2', p3 = 'foo'
 CONTEXT:  PL/pgSQL function footest() line 10 at SQL statement
+-- test warnings when shadowing a variable
+set plpgsql.warnings to 'shadow';
+-- simple shadowing of input and output parameters
+create or replace function shadowtest(in1 int)
+	returns table (out1 int) as $$
+declare
+in1 int;
+out1 int;
+begin
+end
+$$ language plpgsql;
+WARNING:  variable "in1" shadows a previously defined variable
+LINE 4: in1 int;
+        ^
+WARNING:  variable "out1" shadows a previously defined variable
+LINE 5: out1 int;
+        ^
+drop function shadowtest(int);
+-- shadowing in a second DECLARE block
+create or replace function shadowtest()
+	returns void as $$
+declare
+f1 int;
+begin
+	declare
+	f1 int;
+	begin
+	end;
+end$$ language plpgsql;
+WARNING:  variable "f1" shadows a previously defined variable
+LINE 7:  f1 int;
+         ^
+drop function shadowtest();
+-- several levels of shadowing
+create or replace function shadowtest(in1 int)
+	returns void as $$
+declare
+in1 int;
+begin
+	declare
+	in1 int;
+	begin
+	end;
+end$$ language plpgsql;
+WARNING:  variable "in1" shadows a previously defined variable
+LINE 4: in1 int;
+        ^
+WARNING:  variable "in1" shadows a previously defined variable
+LINE 7:  in1 int;
+         ^
+drop function shadowtest(int);
+-- shadowing in cursor definitions
+create or replace function shadowtest()
+	returns void as $$
+declare
+f1 int;
+c1 cursor (f1 int) for select 1;
+begin
+end$$ language plpgsql;
+WARNING:  variable "f1" shadows a previously defined variable
+LINE 5: c1 cursor (f1 int) for select 1;
+                   ^
+drop function shadowtest();
+-- test warnings_as_errors
+set plpgsql.warnings_as_errors to 'on';
+create or replace function shadowtest(f1 int)
+	returns void as $$
+declare f1 int; begin end $$ language plpgsql;
+ERROR:  variable "f1" shadows a previously defined variable
+LINE 3: declare f1 int; begin end $$ language plpgsql;
+                ^
+reset plpgsql.warnings_as_errors;
+reset plpgsql.warnings;
 -- test scrollable cursor support
 create function sc_test() returns setof integer as $$
 declare

@@ -352,6 +352,9 @@ do_compile(FunctionCallInfo fcinfo,
 	function->out_param_varno = -1;		/* set up for no OUT param */
 	function->resolve_option = plpgsql_variable_conflict;
 	function->print_strict_params = plpgsql_print_strict_params;
+	function->warnings = plpgsql_warnings;
+	/* only promote warnings to errors at CREATE FUNCTION time */
+	function->warnings_as_errors = plpgsql_warnings_as_errors && forValidator;
 
 	if (is_dml_trigger)
 		function->fn_is_trigger = PLPGSQL_DML_TRIGGER;
@@ -849,6 +852,9 @@ plpgsql_compile_inline(char *proc_source)
 	function->out_param_varno = -1;		/* set up for no OUT param */
 	function->resolve_option = plpgsql_variable_conflict;
 	function->print_strict_params = plpgsql_print_strict_params;
+	function->warnings = plpgsql_warnings;
+	/* never promote warnings to errors */
+	function->warnings_as_errors = false;
 
 	plpgsql_ns_init();
 	plpgsql_ns_push(func_name);

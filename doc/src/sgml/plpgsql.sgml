@@ -4712,6 +4712,51 @@ a_output := a_output || $$ if v_$$ || referrer_keys.kind || $$ like '$$
   </variablelist>
 
   </sect2>
+  <sect2 id="plpgsql-warnings">
+   <title>Warnings</title>
+
+   <para>
+    To aid the user in finding instances of simple but common problems before
+    they cause harm, <application>PL/PgSQL</> provides a number of
+    <replaceable>warnings</>.  When enabled, a <literal>WARNING</> is emitted
+    during the compilation of a function.  Optionally, if
+    <varname>plpgsql.warnings_as_errors</> is set, an <literal>ERROR</> is
+    raised when attempting to create a function which would otherwise result in
+    a warning.
+   </para>
+
+ <para>
+  Warnings are enabled through the configuration variable
+  <varname>plpgsql.warnings</>.  It can be set either to a comma-separated list
+  of warnings, <literal>"none"</> or <literal>"all"</>.  The default is
+  <literal>"none"</>.  Currently the list of available warnings includes only
+  one:
+  <variablelist>
+   <varlistentry>
+    <term><varname>shadow</varname></term>
+    <listitem>
+     <para>
+      Warns when a declaration shadows a previously defined variable.  For
+      example:
+<programlisting>
+CREATE FUNCTION foo(f1 int) RETURNS int AS $$
+DECLARE
+f1 int;
+BEGIN
+RETURN f1;
+END
+$$ LANGUAGE plpgsql;
+WARNING:  variable "f1" shadows a previously defined variable
+LINE 3: f1 int;
+        ^
+CREATE FUNCTION
+</programlisting>
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </para>
+ </sect2>
  </sect1>
 
   <!-- **** Porting from Oracle PL/SQL **** -->

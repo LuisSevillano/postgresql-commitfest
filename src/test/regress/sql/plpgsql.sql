@@ -2689,6 +2689,68 @@ end$$ language plpgsql;
 
 select footest();
 
+-- test warnings when shadowing a variable
+
+set plpgsql.warnings to 'shadow';
+
+-- simple shadowing of input and output parameters
+create or replace function shadowtest(in1 int)
+	returns table (out1 int) as $$
+declare
+in1 int;
+out1 int;
+begin
+end
+$$ language plpgsql;
+drop function shadowtest(int);
+
+-- shadowing in a second DECLARE block
+create or replace function shadowtest()
+	returns void as $$
+declare
+f1 int;
+begin
+	declare
+	f1 int;
+	begin
+	end;
+end$$ language plpgsql;
+drop function shadowtest();
+
+-- several levels of shadowing
+create or replace function shadowtest(in1 int)
+	returns void as $$
+declare
+in1 int;
+begin
+	declare
+	in1 int;
+	begin
+	end;
+end$$ language plpgsql;
+drop function shadowtest(int);
+
+-- shadowing in cursor definitions
+create or replace function shadowtest()
+	returns void as $$
+declare
+f1 int;
+c1 cursor (f1 int) for select 1;
+begin
+end$$ language plpgsql;
+drop function shadowtest();
+
+-- test warnings_as_errors
+
+set plpgsql.warnings_as_errors to 'on';
+
+create or replace function shadowtest(f1 int)
+	returns void as $$
+declare f1 int; begin end $$ language plpgsql;
+
+reset plpgsql.warnings_as_errors;
+reset plpgsql.warnings;
+
 -- test scrollable cursor support
 
 create function sc_test() returns setof integer as $$
