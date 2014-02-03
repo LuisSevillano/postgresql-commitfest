@@ -57,6 +57,12 @@ typedef struct
 	AppendRelInfo *appinfo;
 } adjust_appendrel_attrs_context;
 
+typedef struct {
+	AppendRelInfo	*child_appinfo;
+	Index			 target_rti;
+	bool			 failed;
+} transvars_merge_context;
+
 static Plan *recurse_set_operations(Node *setOp, PlannerInfo *root,
 					   double tuple_fraction,
 					   List *colTypes, List *colCollations,
@@ -98,6 +104,8 @@ static List *generate_append_tlist(List *colTypes, List *colCollations,
 					  List *input_plans,
 					  List *refnames_tlist);
 static List *generate_setop_grouplist(SetOperationStmt *op, List *targetlist);
+static Node *transvars_merge_mutator(Node *node,
+									 transvars_merge_context *ctx);
 static void expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte,
 						 Index rti);
 static void make_inh_translation_list(Relation oldrelation,
@@ -1210,6 +1218,48 @@ expand_inherited_tables(PlannerInfo *root)
 	}
 }
 
+static Node *
+transvars_merge_mutator(Node *node, transvars_merge_context *ctx)
+{
+	if (node == NULL)
+		return NULL;
+
+	/* fast path after failure */
+	if (ctx->failed)
+		return node;
+
+	if (IsA(node, Var))
+	{
+		Var *oldv = (Var*)node;
+
+		if (!oldv->varlevelsup && oldv->varno == ctx->target_rti)
+		{
+			if (oldv->varattno == 0)
+			{
+				/*
+				 * Appendrels which does whole-row-var conversion cannot be
+				 * removed. ConvertRowtypeExpr can convert only RELs which can
+				 * be referred to using relid.
+				 */
+				ctx->failed = true;
+				return node;
+			}
+			if (oldv->varattno >
+				list_length(ctx->child_appinfo->translated_vars))
+				elog(ERROR,
+					 "attribute %d of relation \"%s\" does not exist",
+					 oldv->varattno,
+					 get_rel_name(ctx->child_appinfo->parent_reloid));
+
+			return (Node*)copyObject(
+				list_nth(ctx->child_appinfo->translated_vars,
+						 oldv->varattno - 1));
+		}
+	}
+	return expression_tree_mutator(node,
+								   transvars_merge_mutator, (void*)ctx);
+}
+
 /*
  * expand_inherited_rtentry
  *		Check whether a rangetable entry represents an inheritance set.
@@ -1237,6 +1287,8 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 	List	   *inhOIDs;
 	List	   *appinfos;
 	ListCell   *l;
+	AppendRelInfo *parent_appinfo = NULL;
+	bool		detach_parent = false;
 
 	/* Does RT entry allow inheritance? */
 	if (!rte->inh)
@@ -1301,6 +1353,22 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 		oldrc->isParent = true;
 
 	/*
+	 * If parent relation is appearing in a subselect of UNION ALL, it has
+	 * further parent appendrelinfo. Save it to pull up inheritance children
+	 * later.
+	 */
+	foreach(l, root->append_rel_list)
+	{
+		AppendRelInfo *appinfo = (AppendRelInfo *)lfirst(l);
+		if(appinfo->child_relid == rti)
+		{
+			parent_appinfo = appinfo;
+			detach_parent = true;
+			break;
+		}
+	}
+	
+	/*
 	 * Must open the parent relation to examine its tupdesc.  We need not lock
 	 * it; we assume the rewriter already did.
 	 */
@@ -1308,6 +1376,7 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 
 	/* Scan the inheritance set and expand it */
 	appinfos = NIL;
+
 	foreach(l, inhOIDs)
 	{
 		Oid			childOID = lfirst_oid(l);
@@ -1378,6 +1447,46 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 		}
 
 		/*
+		 * Pull up this appinfo onto just above of the parent. The parent
+		 * relation has its own parent when it appears as a subquery of UNION
+		 * ALL. Pulling up these children gives a chance to consider
+		 * MergeAppend on whole the UNION ALL tree.
+		 */
+
+		if (parent_appinfo)
+		{
+			transvars_merge_context ctx;
+
+			ctx.child_appinfo = appinfo;
+			ctx.target_rti	  = rti;
+
+			if (parent_appinfo->parent_reltype == 0 &&
+				parent_appinfo->child_reltype == 0)
+			{
+				List *new_transvars;
+
+				/*
+				 * Connect this appinfo up to the parent RTE of
+				 * parent_appinfo.
+				 */
+				ctx.failed = false;
+				new_transvars = (List*)expression_tree_mutator(
+					(Node*)parent_appinfo->translated_vars,
+					transvars_merge_mutator, &ctx);
+				
+				if (ctx.failed)
+					/* Some children remain so this parent cannot detach */
+					detach_parent = false;
+				else
+				{
+					appinfo->parent_relid = parent_appinfo->parent_relid;
+					appinfo->parent_reltype = parent_appinfo->parent_reltype;
+					appinfo->translated_vars = new_transvars;
+				}
+			}
+		}
+
+		/*
 		 * Build a PlanRowMark if parent is marked FOR UPDATE/SHARE.
 		 */
 		if (oldrc)
@@ -1397,6 +1506,14 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 		/* Close child relations, but keep locks */
 		if (childOID != parentOID)
 			heap_close(newrelation, NoLock);
+	}
+
+	/* Remove childless appinfo from inheritance tree */
+	if (detach_parent)
+	{
+		rte->inh = false;
+		parent_appinfo->parent_relid = InvalidOid;
+		parent_appinfo->child_relid = InvalidOid;
 	}
 
 	heap_close(oldrelation, NoLock);
@@ -1662,7 +1779,8 @@ adjust_appendrel_attrs_mutator(Node *node,
 				 * step to convert the tuple layout to the parent's rowtype.
 				 * Otherwise we have to generate a RowExpr.
 				 */
-				if (OidIsValid(appinfo->child_reltype))
+				if (OidIsValid(appinfo->child_reltype) &&
+					OidIsValid(appinfo->parent_reltype))
 				{
 					Assert(var->vartype == appinfo->parent_reltype);
 					if (appinfo->parent_reltype != appinfo->child_reltype)

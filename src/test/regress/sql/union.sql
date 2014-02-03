@@ -198,9 +198,29 @@ explain (costs off)
   SELECT * FROM t2) t
  WHERE ab = 'ab';
 
+--
+-- Test that ORDER BY for UNION ALL can be pushed down on inheritance
+-- tables.
+--
+
+CREATE TEMP TABLE t1c (like t1 including indexes) inherits (t1);	  
+CREATE TEMP TABLE t2c (like t2 including indexes) inherits (t2);
+INSERT INTO t1c VALUES ('v', 'w'), ('c', 'd');
+INSERT INTO t2c VALUES ('vw'), ('cd');
+set enable_seqscan = on;
+set enable_indexonlyscan = off;
+
+explain (costs off)
+  SELECT * FROM	
+  (SELECT a || b AS ab FROM t1
+   UNION ALL
+   SELECT * FROM t2) t
+  ORDER BY ab LIMIT 1;
+
 reset enable_seqscan;
 reset enable_indexscan;
 reset enable_bitmapscan;
+reset enable_indexonlyscan;
 
 -- Test constraint exclusion of UNION ALL subqueries
 explain (costs off)
