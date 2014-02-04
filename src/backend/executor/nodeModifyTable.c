@@ -488,7 +488,7 @@ ldelete:;
 		(estate->es_processed)++;
 
 	/* AFTER ROW DELETE Triggers */
-	ExecARDeleteTriggers(estate, resultRelInfo, tupleid);
+	ExecARDeleteTriggers(estate, resultRelInfo, tupleid, planSlot);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
@@ -788,7 +788,7 @@ lreplace:;
 		(estate->es_processed)++;
 
 	/* AFTER ROW UPDATE Triggers */
-	ExecARUpdateTriggers(estate, resultRelInfo, tupleid, tuple,
+	ExecARUpdateTriggers(estate, resultRelInfo, tupleid, tuple, planSlot,
 						 recheckIndexes);
 
 	list_free(recheckIndexes);
@@ -986,7 +986,20 @@ ExecModifyTable(ModifyTableState *node)
 				}
 				else if (relkind == RELKIND_FOREIGN_TABLE)
 				{
-					/* do nothing; FDW must fetch any junk attrs it wants */
+					/*
+					 * If the junkAttNo is valid, then it identifies the
+					 * wholerow attribute. This is the case when there is an
+					 * UPDATE or DELETE trigger.
+					 */
+					if (AttributeNumberIsValid(junkfilter->jf_junkAttNo))
+					{
+						datum = ExecGetJunkAttribute(slot,
+													 junkfilter->jf_junkAttNo,
+													 &isNull);
+						if (isNull)
+							elog(ERROR, "wholerow is NULL");
+						oldtuple = DatumGetHeapTupleHeader(datum);
+					}
 				}
 				else
 				{
@@ -1334,7 +1347,14 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 					}
 					else if (relkind == RELKIND_FOREIGN_TABLE)
 					{
-						/* FDW must fetch any junk attrs it wants */
+						/*
+						 * When there is an AFTER trigger, there should be a
+						 * wholerow attribute.
+						 */
+						AttrNumber	junkAttNo = ExecFindJunkAttribute(j, "wholerow");
+
+						if (AttributeNumberIsValid(junkAttNo))
+							j->jf_junkAttNo = junkAttNo;
 					}
 					else
 					{

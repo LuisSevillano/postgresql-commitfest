@@ -93,7 +93,7 @@ CREATE [ CONSTRAINT ] TRIGGER <replaceable class="PARAMETER">name</replaceable> 
 
   <para>
    The following table summarizes which types of triggers may be used on
-   tables and views:
+   tables, views and foreign tables:
   </para>
 
   <informaltable id="supported-trigger-types">
@@ -110,8 +110,8 @@ CREATE [ CONSTRAINT ] TRIGGER <replaceable class="PARAMETER">name</replaceable> 
      <row>
       <entry align="center" morerows="1"><literal>BEFORE</></entry>
       <entry align="center"><command>INSERT</>/<command>UPDATE</>/<command>DELETE</></entry>
-      <entry align="center">Tables</entry>
-      <entry align="center">Tables and views</entry>
+      <entry align="center">Tables, foreign tables</entry>
+      <entry align="center">Tables, views and foreign tables</entry>
      </row>
      <row>
       <entry align="center"><command>TRUNCATE</></entry>
@@ -121,8 +121,8 @@ CREATE [ CONSTRAINT ] TRIGGER <replaceable class="PARAMETER">name</replaceable> 
      <row>
       <entry align="center" morerows="1"><literal>AFTER</></entry>
       <entry align="center"><command>INSERT</>/<command>UPDATE</>/<command>DELETE</></entry>
-      <entry align="center">Tables</entry>
-      <entry align="center">Tables and views</entry>
+      <entry align="center">Tables, foreign tables</entry>
+      <entry align="center">Tables, views and foreign tables</entry>
      </row>
      <row>
       <entry align="center"><command>TRUNCATE</></entry>
@@ -244,7 +244,7 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
     <term><replaceable class="parameter">table_name</replaceable></term>
     <listitem>
      <para>
-      The name (optionally schema-qualified) of the table or view the trigger
+      The name (optionally schema-qualified) of the table, view or foreign table the trigger
       is for.
      </para>
     </listitem>

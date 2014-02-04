@@ -240,7 +240,22 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 
 	result->commandType = parse->commandType;
 	result->queryId = parse->queryId;
-	result->hasReturning = (parse->returningList != NIL);
+
+	/*
+	 * Mark the result as having RETURNING only if the returning target list
+	 * has non-resjunk entries
+	 */
+	result->hasReturning = false;
+	foreach(lp, parse->returningList)
+	{
+		TargetEntry *tle = lfirst(lp);
+
+		if (!tle->resjunk)
+		{
+			result->hasReturning = true;
+			break;
+		}
+	}
 	result->hasModifyingCTE = parse->hasModifyingCTE;
 	result->canSetTag = parse->canSetTag;
 	result->transientPlan = glob->transientPlan;

@@ -55,6 +55,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
+#include "utils/tuplestore.h"
 
 
 /* GUC variables */
@@ -75,6 +76,9 @@ static HeapTuple GetTupleForTrigger(EState *estate,
 				   ItemPointer tid,
 				   LockTupleMode lockmode,
 				   TupleTableSlot **newSlot);
+
+static HeapTuple ExtractOldTuple(TupleTableSlot *mixedtupleslot,
+				ResultRelInfo *relinfo);
 static bool TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 			   Trigger *trigger, TriggerEvent event,
 			   Bitmapset *modifiedCols,
@@ -184,12 +188,22 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 							RelationGetRelationName(rel)),
 					 errdetail("Views cannot have TRUNCATE triggers.")));
 	}
+	else if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		if (stmt->isconstraint)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("\"%s\" is a foreign table",
+							RelationGetRelationName(rel)),
+			  errdetail("Foreign Tables cannot have constraint triggers.")));
+	}
 	else
+	{
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a table or view",
 						RelationGetRelationName(rel))));
-
+	}
 	if (!allowSystemTableMods && IsSystemRelation(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -1062,10 +1076,11 @@ RemoveTriggerById(Oid trigOid)
 	rel = heap_open(relid, AccessExclusiveLock);
 
 	if (rel->rd_rel->relkind != RELKIND_RELATION &&
-		rel->rd_rel->relkind != RELKIND_VIEW)
+		rel->rd_rel->relkind != RELKIND_VIEW &&
+		rel->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table or view",
+				 errmsg("\"%s\" is not a table, view or foreign table",
 						RelationGetRelationName(rel))));
 
 	if (!allowSystemTableMods && IsSystemRelation(rel))
@@ -1166,10 +1181,11 @@ RangeVarCallbackForRenameTrigger(const RangeVar *rv, Oid relid, Oid oldrelid,
 	form = (Form_pg_class) GETSTRUCT(tuple);
 
 	/* only tables and views can have triggers */
-	if (form->relkind != RELKIND_RELATION && form->relkind != RELKIND_VIEW)
+	if (form->relkind != RELKIND_RELATION && form->relkind != RELKIND_VIEW &&
+		form->relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table or view", rv->relname)));
+		errmsg("\"%s\" is not a table, view or foreign table", rv->relname)));
 
 	/* you must own the table to rename one of its triggers */
 	if (!pg_class_ownercheck(relid, GetUserId()))
@@ -1844,9 +1860,7 @@ ExecCallTriggerFunc(TriggerData *trigdata,
 	 */
 	InitFunctionCallInfoData(fcinfo, finfo, 0,
 							 InvalidOid, (Node *) trigdata, NULL);
-
 	pgstat_init_function_usage(&fcinfo, &fcusage);
-
 	MyTriggerDepth++;
 	PG_TRY();
 	{
@@ -2155,9 +2169,18 @@ ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 	HeapTuple	newtuple;
 	TupleTableSlot *newSlot;
 	int			i;
+	Relation	rel = relinfo->ri_RelationDesc;
 
-	trigtuple = GetTupleForTrigger(estate, epqstate, relinfo, tupleid,
-								   LockTupleExclusive, &newSlot);
+	if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		newSlot = NULL;
+		trigtuple = ExtractOldTuple(epqstate->origslot, relinfo);
+	}
+	else
+	{
+		trigtuple = GetTupleForTrigger(estate, epqstate, relinfo, tupleid,
+									   LockTupleExclusive, &newSlot);
+	}
 	if (trigtuple == NULL)
 		return false;
 
@@ -2204,19 +2227,33 @@ ExecBRDeleteTriggers(EState *estate, EPQState *epqstate,
 
 void
 ExecARDeleteTriggers(EState *estate, ResultRelInfo *relinfo,
-					 ItemPointer tupleid)
+					 ItemPointer tupleid,
+					 TupleTableSlot *slot)
 {
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
 
 	if (trigdesc && trigdesc->trig_delete_after_row)
 	{
-		HeapTuple	trigtuple = GetTupleForTrigger(estate,
-												   NULL,
-												   relinfo,
-												   tupleid,
-												   LockTupleExclusive,
-												   NULL);
+		Relation	rel = relinfo->ri_RelationDesc;
+		HeapTuple	trigtuple;
 
+		/*
+		 * For FOREIGN Table, after triggers are fired immediately, since
+		 * there cannot be any constraint triggers.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+		{
+			trigtuple = ExtractOldTuple(slot, relinfo);
+		}
+		else
+		{
+			trigtuple = GetTupleForTrigger(estate,
+										   NULL,
+										   relinfo,
+										   tupleid,
+										   LockTupleExclusive,
+										   NULL);
+		}
 		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_DELETE,
 							  true, trigtuple, NULL, NIL, NULL);
 		heap_freetuple(trigtuple);
@@ -2335,7 +2372,8 @@ ExecASUpdateTriggers(EState *estate, ResultRelInfo *relinfo)
 TupleTableSlot *
 ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid, TupleTableSlot *slot)
+					 ItemPointer tupleid,
+					 TupleTableSlot *slot)
 {
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
 	HeapTuple	slottuple = ExecMaterializeSlot(slot);
@@ -2345,6 +2383,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 	HeapTuple	oldtuple;
 	TupleTableSlot *newSlot;
 	int			i;
+	Relation	relation = relinfo->ri_RelationDesc;
 	Bitmapset  *modifiedCols;
 	Bitmapset  *keyCols;
 	LockTupleMode lockmode;
@@ -2355,7 +2394,7 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 	 * concurrency.
 	 */
 	modifiedCols = GetModifiedColumns(relinfo, estate);
-	keyCols = RelationGetIndexAttrBitmap(relinfo->ri_RelationDesc,
+	keyCols = RelationGetIndexAttrBitmap(relation,
 										 INDEX_ATTR_BITMAP_KEY);
 	if (bms_overlap(keyCols, modifiedCols))
 		lockmode = LockTupleExclusive;
@@ -2363,8 +2402,16 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 		lockmode = LockTupleNoKeyExclusive;
 
 	/* get a copy of the on-disk tuple we are planning to update */
-	trigtuple = GetTupleForTrigger(estate, epqstate, relinfo, tupleid,
-								   lockmode, &newSlot);
+	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		newSlot = NULL;
+		trigtuple = ExtractOldTuple(epqstate->origslot, relinfo);
+	}
+	else
+	{
+		trigtuple = GetTupleForTrigger(estate, epqstate, relinfo, tupleid,
+									   lockmode, &newSlot);
+	}
 	if (trigtuple == NULL)
 		return NULL;			/* cancel the update action */
 
@@ -2446,24 +2493,40 @@ ExecBRUpdateTriggers(EState *estate, EPQState *epqstate,
 
 void
 ExecARUpdateTriggers(EState *estate, ResultRelInfo *relinfo,
-					 ItemPointer tupleid, HeapTuple newtuple,
+					 ItemPointer tupleid,
+					 HeapTuple newtuple,
+					 TupleTableSlot *slot,
 					 List *recheckIndexes)
 {
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
 
 	if (trigdesc && trigdesc->trig_update_after_row)
 	{
-		HeapTuple	trigtuple = GetTupleForTrigger(estate,
-												   NULL,
-												   relinfo,
-												   tupleid,
-												   LockTupleExclusive,
-												   NULL);
+		Relation	rel = relinfo->ri_RelationDesc;
+		HeapTuple	trigtuple;
 
+		/*
+		 * For FOREIGN Table, after triggers are fired immediately, since
+		 * there cannot be any constraint triggers.
+		 */
+		if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+		{
+			trigtuple = ExtractOldTuple(slot, relinfo);
+		}
+		else
+		{
+			trigtuple = GetTupleForTrigger(estate,
+										   NULL,
+										   relinfo,
+										   tupleid,
+										   LockTupleExclusive,
+										   NULL);
+		}
 		AfterTriggerSaveEvent(estate, relinfo, TRIGGER_EVENT_UPDATE,
 							  true, trigtuple, newtuple, recheckIndexes,
 							  GetModifiedColumns(relinfo, estate));
 		heap_freetuple(trigtuple);
+
 	}
 }
 
@@ -2731,6 +2794,33 @@ ltrmark:;
 }
 
 /*
+ * Get an old tuple from a "mixed tuple", containing both the new values as well
+ * as well as the old ones as resjunk columns.
+ */
+static HeapTuple
+ExtractOldTuple(TupleTableSlot *planSlot,
+				ResultRelInfo *relinfo)
+{
+	bool		isNull;
+	JunkFilter *junkfilter = relinfo->ri_junkFilter;
+	HeapTuple	oldtuple = palloc0(sizeof(HeapTupleData));
+	HeapTupleHeader td;
+	Datum		datum = ExecGetJunkAttribute(planSlot,
+											 junkfilter->jf_junkAttNo,
+											 &isNull);
+
+	/* shouldn't ever get a null result... */
+	if (isNull)
+		elog(ERROR, "wholerow is NULL");
+	td = DatumGetHeapTupleHeader(datum);
+	oldtuple->t_len = HeapTupleHeaderGetDatumLength(td);
+	oldtuple->t_data = td;
+	oldtuple->t_tableOid = RelationGetRelid(relinfo->ri_RelationDesc);
+	return oldtuple;
+}
+
+
+/*
  * Is trigger enabled to fire?
  */
 static bool
@@ -2948,6 +3038,7 @@ typedef uint32 TriggerFlags;
 #define AFTER_TRIGGER_2CTIDS			0x10000000
 #define AFTER_TRIGGER_DONE				0x20000000
 #define AFTER_TRIGGER_IN_PROGRESS		0x40000000
+#define AFTER_TRIGGER_FDW				0x80000000
 
 typedef struct AfterTriggerSharedData *AfterTriggerShared;
 
@@ -2975,9 +3066,17 @@ typedef struct AfterTriggerEventDataOneCtid
 	ItemPointerData ate_ctid1;	/* inserted, deleted, or old updated tuple */
 }	AfterTriggerEventDataOneCtid;
 
+typedef struct AfterTriggerEventDataFDW
+{
+	TriggerFlags ate_flags;		/* status bits and offset to shared data */
+	int			ate_tupleindex; /* index of the first tuple */
+}	AfterTriggerEventDataFDW;
+
 #define SizeofTriggerEvent(evt) \
 	(((evt)->ate_flags & AFTER_TRIGGER_2CTIDS) ? \
-	 sizeof(AfterTriggerEventData) : sizeof(AfterTriggerEventDataOneCtid))
+	 sizeof(AfterTriggerEventData) : \
+		((evt)->ate_flags & AFTER_TRIGGER_FDW) ? sizeof(AfterTriggerEventDataFDW) : \
+		sizeof(AfterTriggerEventDataOneCtid))
 
 #define GetTriggerSharedData(evt) \
 	((AfterTriggerShared) ((char *) (evt) + ((evt)->ate_flags & AFTER_TRIGGER_OFFSET)))
@@ -3020,6 +3119,14 @@ typedef struct AfterTriggerEventList
 	for_each_chunk(cptr, evtlist) for_each_event(eptr, cptr)
 
 
+/* A wrapper around Tuplestorestate to keep the last read/written positions */
+typedef struct FDWTuplestore
+{
+	Tuplestorestate *fdwts_tuplestore;
+	int			fdwts_nextwrite;
+	int			fdwts_lastread;
+}	FDWTuplestore;
+
 /*
  * All per-transaction data for the AFTER TRIGGERS module.
  *
@@ -3050,7 +3157,11 @@ typedef struct AfterTriggerEventList
  * immediate-mode triggers, and append any deferred events to the main events
  * list.
  *
- * maxquerydepth is just the allocated length of query_stack.
+ * fdw_tuplestores[query_depth] is a list of FDWTuplestore containing the
+ * foreign tuples needed for the current query.
+ *
+ * maxquerydepth is just the allocated length of query_stack and
+ * fdw_tuplestores.
  *
  * state_stack is a stack of pointers to saved copies of the SET CONSTRAINTS
  * state data; each subtransaction level that modifies that state first
@@ -3071,6 +3182,7 @@ typedef struct AfterTriggerEventList
  * each stack.	(By not keeping our own stack pointer, we can avoid trouble
  * in cases where errors during subxact abort cause multiple invocations
  * of AfterTriggerEndSubXact() at the same nesting depth.)
+ *
  */
 typedef struct AfterTriggersData
 {
@@ -3089,23 +3201,44 @@ typedef struct AfterTriggersData
 	int		   *depth_stack;	/* stacked query_depths */
 	CommandId  *firing_stack;	/* stacked firing_counters */
 	int			maxtransdepth;	/* allocated len of above arrays */
+	FDWTuplestore **fdw_tuplestores;	/* tuplestore for each query */
 } AfterTriggersData;
 
 typedef AfterTriggersData *AfterTriggers;
 
 static AfterTriggers afterTriggers;
 
-
 static void AfterTriggerExecute(AfterTriggerEvent event,
 					Relation rel, TriggerDesc *trigdesc,
 					FmgrInfo *finfo,
 					Instrumentation *instr,
-					MemoryContext per_tuple_context);
+					MemoryContext per_tuple_context,
+					TupleTableSlot *trig_tuple_slot);
 static SetConstraintState SetConstraintStateCreate(int numalloc);
 static SetConstraintState SetConstraintStateCopy(SetConstraintState state);
 static SetConstraintState SetConstraintStateAddItem(SetConstraintState state,
 						  Oid tgoid, bool tgisdeferred);
 
+
+/*
+ * Gets the current query fdwtuple store, and inializes it
+ * if necessary
+ */
+static FDWTuplestore *
+GetCurrentFDWTuplestore()
+{
+	FDWTuplestore *fdw_tuplestore = afterTriggers->fdw_tuplestores[afterTriggers->query_depth];
+
+	if (fdw_tuplestore == NULL)
+	{
+		fdw_tuplestore = palloc(sizeof(FDWTuplestore));
+		fdw_tuplestore->fdwts_tuplestore = tuplestore_begin_heap(true, false, work_mem);
+		fdw_tuplestore->fdwts_nextwrite = 0;
+		fdw_tuplestore->fdwts_lastread = 0;
+		afterTriggers->fdw_tuplestores[afterTriggers->query_depth] = fdw_tuplestore;
+	}
+	return fdw_tuplestore;
+}
 
 /* ----------
  * afterTriggerCheckState()
@@ -3353,7 +3486,8 @@ static void
 AfterTriggerExecute(AfterTriggerEvent event,
 					Relation rel, TriggerDesc *trigdesc,
 					FmgrInfo *finfo, Instrumentation *instr,
-					MemoryContext per_tuple_context)
+					MemoryContext per_tuple_context,
+					TupleTableSlot *trig_tuple_slot)
 {
 	AfterTriggerShared evtshared = GetTriggerSharedData(event);
 	Oid			tgoid = evtshared->ats_tgoid;
@@ -3390,34 +3524,84 @@ AfterTriggerExecute(AfterTriggerEvent event,
 	/*
 	 * Fetch the required tuple(s).
 	 */
-	if (ItemPointerIsValid(&(event->ate_ctid1)))
+	if (event->ate_flags & AFTER_TRIGGER_FDW)
 	{
-		ItemPointerCopy(&(event->ate_ctid1), &(tuple1.t_self));
-		if (!heap_fetch(rel, SnapshotAny, &tuple1, &buffer1, false, NULL))
-			elog(ERROR, "failed to fetch tuple1 for AFTER trigger");
-		LocTriggerData.tg_trigtuple = &tuple1;
-		LocTriggerData.tg_trigtuplebuf = buffer1;
-	}
-	else
-	{
-		LocTriggerData.tg_trigtuple = NULL;
-		LocTriggerData.tg_trigtuplebuf = InvalidBuffer;
-	}
+		FDWTuplestore *fdw_tuplestore = GetCurrentFDWTuplestore();
+		AfterTriggerEventDataFDW *fdwevent = (AfterTriggerEventDataFDW *) event;
 
-	/* don't touch ctid2 if not there */
-	if ((event->ate_flags & AFTER_TRIGGER_2CTIDS) &&
-		ItemPointerIsValid(&(event->ate_ctid2)))
-	{
-		ItemPointerCopy(&(event->ate_ctid2), &(tuple2.t_self));
-		if (!heap_fetch(rel, SnapshotAny, &tuple2, &buffer2, false, NULL))
-			elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
-		LocTriggerData.tg_newtuple = &tuple2;
-		LocTriggerData.tg_newtuplebuf = buffer2;
+		/*
+		 * Seek to the given index
+		 */
+		if (fdw_tuplestore->fdwts_lastread > fdwevent->ate_tupleindex)
+		{
+			if (fdw_tuplestore->fdwts_lastread - fdwevent->ate_tupleindex < fdwevent->ate_tupleindex)
+			{
+				while (fdw_tuplestore->fdwts_lastread > fdwevent->ate_tupleindex)
+				{
+					tuplestore_advance(fdw_tuplestore->fdwts_tuplestore, false);
+					fdw_tuplestore->fdwts_lastread--;
+				}
+			}
+			else
+			{
+				tuplestore_rescan(fdw_tuplestore->fdwts_tuplestore);
+				fdw_tuplestore->fdwts_lastread = 0;
+			}
+		}
+		while (fdw_tuplestore->fdwts_lastread < fdwevent->ate_tupleindex)
+		{
+			tuplestore_advance(fdw_tuplestore->fdwts_tuplestore, true);
+			fdw_tuplestore->fdwts_lastread++;
+		}
+		if (!tuplestore_gettupleslot(fdw_tuplestore->fdwts_tuplestore, true, false, trig_tuple_slot))
+		{
+			elog(ERROR, "failed to fetch tuple1 for AFTER trigger");
+		}
+		fdw_tuplestore->fdwts_lastread++;
+		LocTriggerData.tg_trigtuple = ExecCopySlotTuple(trig_tuple_slot);
+		LocTriggerData.tg_trigtuplebuf = InvalidBuffer;
+		if (event->ate_flags & AFTER_TRIGGER_2CTIDS)
+		{
+			if (!tuplestore_gettupleslot(fdw_tuplestore->fdwts_tuplestore, true, false, trig_tuple_slot))
+			{
+				elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
+			}
+			fdw_tuplestore->fdwts_lastread++;
+			LocTriggerData.tg_newtuple = ExecCopySlotTuple(trig_tuple_slot);
+			LocTriggerData.tg_newtuplebuf = InvalidBuffer;
+		}
 	}
 	else
 	{
-		LocTriggerData.tg_newtuple = NULL;
-		LocTriggerData.tg_newtuplebuf = InvalidBuffer;
+		if (ItemPointerIsValid(&(event->ate_ctid1)))
+		{
+			ItemPointerCopy(&(event->ate_ctid1), &(tuple1.t_self));
+			if (!heap_fetch(rel, SnapshotAny, &tuple1, &buffer1, false, NULL))
+				elog(ERROR, "failed to fetch tuple1 for AFTER trigger");
+			LocTriggerData.tg_trigtuple = &tuple1;
+			LocTriggerData.tg_trigtuplebuf = buffer1;
+		}
+		else
+		{
+			LocTriggerData.tg_trigtuple = NULL;
+			LocTriggerData.tg_trigtuplebuf = InvalidBuffer;
+		}
+
+		/* don't touch ctid2 if not there */
+		if ((event->ate_flags & AFTER_TRIGGER_2CTIDS) &&
+			ItemPointerIsValid(&(event->ate_ctid2)))
+		{
+			ItemPointerCopy(&(event->ate_ctid2), &(tuple2.t_self));
+			if (!heap_fetch(rel, SnapshotAny, &tuple2, &buffer2, false, NULL))
+				elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
+			LocTriggerData.tg_newtuple = &tuple2;
+			LocTriggerData.tg_newtuplebuf = buffer2;
+		}
+		else
+		{
+			LocTriggerData.tg_newtuple = NULL;
+			LocTriggerData.tg_newtuplebuf = InvalidBuffer;
+		}
 	}
 
 	/*
@@ -3559,6 +3743,7 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 	TriggerDesc *trigdesc = NULL;
 	FmgrInfo   *finfo = NULL;
 	Instrumentation *instr = NULL;
+	TupleTableSlot *slot = NULL;
 
 	/* Make a local EState if need be */
 	if (estate == NULL)
@@ -3574,7 +3759,6 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 							  ALLOCSET_DEFAULT_MINSIZE,
 							  ALLOCSET_DEFAULT_INITSIZE,
 							  ALLOCSET_DEFAULT_MAXSIZE);
-
 	for_each_chunk(chunk, *events)
 	{
 		AfterTriggerEvent event;
@@ -3603,6 +3787,11 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 					trigdesc = rInfo->ri_TrigDesc;
 					finfo = rInfo->ri_TrigFunctions;
 					instr = rInfo->ri_TrigInstrument;
+					/* Make a slot to read back tuple from the tuplestore */
+					if (slot != NULL)
+						ExecDropSingleTupleTableSlot(slot);
+					if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+						slot = MakeSingleTupleTableSlot(rel->rd_att);
 					if (trigdesc == NULL)		/* should not happen */
 						elog(ERROR, "relation %u has no triggers",
 							 evtshared->ats_relid);
@@ -3614,7 +3803,7 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 				 * won't try to re-fire it.
 				 */
 				AfterTriggerExecute(event, rel, trigdesc, finfo, instr,
-									per_tuple_context);
+									per_tuple_context, slot);
 
 				/*
 				 * Mark the event as done.
@@ -3645,6 +3834,9 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 				events->tailfree = chunk->freeptr;
 		}
 	}
+	if (slot != NULL)
+		ExecDropSingleTupleTableSlot(slot);
+
 
 	/* Release working resources */
 	MemoryContextDelete(per_tuple_context);
@@ -3698,6 +3890,10 @@ AfterTriggerBeginXact(void)
 	afterTriggers->query_stack = (AfterTriggerEventList *)
 		MemoryContextAlloc(TopTransactionContext,
 						   8 * sizeof(AfterTriggerEventList));
+	/* Same for the tuplestore used for fdw tuples */
+	afterTriggers->fdw_tuplestores = (FDWTuplestore **)
+		MemoryContextAllocZero(TopTransactionContext,
+							   8 * sizeof(FDWTuplestore *));
 	afterTriggers->maxquerydepth = 8;
 
 	/* Context for events is created only when needed */
@@ -3743,6 +3939,13 @@ AfterTriggerBeginQuery(void)
 		afterTriggers->query_stack = (AfterTriggerEventList *)
 			repalloc(afterTriggers->query_stack,
 					 new_alloc * sizeof(AfterTriggerEventList));
+		afterTriggers->fdw_tuplestores = (FDWTuplestore **)
+			repalloc(afterTriggers->fdw_tuplestores,
+					 new_alloc * sizeof(FDWTuplestore *));
+		/* Ensure the newly allocated slots are NULL, since they will be */
+		/* initialized lazily. */
+		MemSet(afterTriggers->fdw_tuplestores + (afterTriggers->maxquerydepth * sizeof(FDWTuplestore *)), 0,
+			   afterTriggers->maxquerydepth * sizeof(FDWTuplestore *));
 		afterTriggers->maxquerydepth = new_alloc;
 	}
 
@@ -3770,6 +3973,7 @@ void
 AfterTriggerEndQuery(EState *estate)
 {
 	AfterTriggerEventList *events;
+	FDWTuplestore *fdw_tuplestore;
 
 	/* Must be inside a transaction */
 	Assert(afterTriggers != NULL);
@@ -3810,9 +4014,18 @@ AfterTriggerEndQuery(EState *estate)
 			break;
 	}
 
+	/*
+	 * Release the current query FDW tuples store (if any)
+	 */
+	fdw_tuplestore = afterTriggers->fdw_tuplestores[afterTriggers->query_depth];
+	if (fdw_tuplestore)
+	{
+		tuplestore_end(fdw_tuplestore->fdwts_tuplestore);
+		pfree(fdw_tuplestore);
+		afterTriggers->fdw_tuplestores[afterTriggers->query_depth] = NULL;
+	}
 	/* Release query-local storage for events */
 	afterTriggerFreeEventList(&afterTriggers->query_stack[afterTriggers->query_depth]);
-
 	afterTriggers->query_depth--;
 }
 
@@ -3900,8 +4113,9 @@ AfterTriggerEndXact(bool isCommit)
 	 * of memory for the list!
 	 */
 	if (afterTriggers && afterTriggers->event_cxt)
+	{
 		MemoryContextDelete(afterTriggers->event_cxt);
-
+	}
 	afterTriggers = NULL;
 }
 
@@ -3945,7 +4159,6 @@ AfterTriggerBeginSubXact(void)
 			afterTriggers->firing_stack = (CommandId *)
 				palloc(DEFTRIG_INITALLOC * sizeof(CommandId));
 			afterTriggers->maxtransdepth = DEFTRIG_INITALLOC;
-
 			MemoryContextSwitchTo(old_cxt);
 		}
 		else
@@ -4032,6 +4245,15 @@ AfterTriggerEndSubXact(bool isCommit)
 		 */
 		while (afterTriggers->query_depth > afterTriggers->depth_stack[my_level])
 		{
+			FDWTuplestore *fdw_tuplestore = afterTriggers->fdw_tuplestores[afterTriggers->query_depth];
+
+			if (fdw_tuplestore)
+			{
+				tuplestore_end(fdw_tuplestore->fdwts_tuplestore);
+				pfree(fdw_tuplestore);
+				afterTriggers->fdw_tuplestores[afterTriggers->query_depth] = NULL;
+			}
+
 			afterTriggerFreeEventList(&afterTriggers->query_stack[afterTriggers->query_depth]);
 			afterTriggers->query_depth--;
 		}
@@ -4528,9 +4750,11 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	TriggerDesc *trigdesc = relinfo->ri_TrigDesc;
 	AfterTriggerEventData new_event;
 	AfterTriggerSharedData new_shared;
+	char		relkind = relinfo->ri_RelationDesc->rd_rel->relkind;
 	int			tgtype_event;
 	int			tgtype_level;
 	int			i;
+	FDWTuplestore *fdw_tuplestore = NULL;
 
 	/*
 	 * Check state.  We use normal tests not Asserts because it is possible to
@@ -4550,6 +4774,10 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	 * arrays.
 	 */
 	new_event.ate_flags = 0;
+	if (relkind == RELKIND_FOREIGN_TABLE && row_trigger)
+	{
+		new_event.ate_flags = AFTER_TRIGGER_FDW;
+	}
 	switch (event)
 	{
 		case TRIGGER_EVENT_INSERT:
@@ -4558,8 +4786,15 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			{
 				Assert(oldtup == NULL);
 				Assert(newtup != NULL);
-				ItemPointerCopy(&(newtup->t_self), &(new_event.ate_ctid1));
-				ItemPointerSetInvalid(&(new_event.ate_ctid2));
+				if (relkind == RELKIND_FOREIGN_TABLE)
+				{
+					oldtup = newtup;
+				}
+				else
+				{
+					ItemPointerCopy(&(newtup->t_self), &(new_event.ate_ctid1));
+					ItemPointerSetInvalid(&(new_event.ate_ctid2));
+				}
 			}
 			else
 			{
@@ -4575,8 +4810,11 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			{
 				Assert(oldtup != NULL);
 				Assert(newtup == NULL);
-				ItemPointerCopy(&(oldtup->t_self), &(new_event.ate_ctid1));
-				ItemPointerSetInvalid(&(new_event.ate_ctid2));
+				if (relkind != RELKIND_FOREIGN_TABLE)
+				{
+					ItemPointerCopy(&(oldtup->t_self), &(new_event.ate_ctid1));
+					ItemPointerSetInvalid(&(new_event.ate_ctid2));
+				}
 			}
 			else
 			{
@@ -4592,9 +4830,12 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			{
 				Assert(oldtup != NULL);
 				Assert(newtup != NULL);
-				ItemPointerCopy(&(oldtup->t_self), &(new_event.ate_ctid1));
-				ItemPointerCopy(&(newtup->t_self), &(new_event.ate_ctid2));
 				new_event.ate_flags |= AFTER_TRIGGER_2CTIDS;
+				if (relkind != RELKIND_FOREIGN_TABLE)
+				{
+					ItemPointerCopy(&(oldtup->t_self), &(new_event.ate_ctid1));
+					ItemPointerCopy(&(newtup->t_self), &(new_event.ate_ctid2));
+				}
 			}
 			else
 			{
@@ -4631,6 +4872,12 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 		if (!TriggerEnabled(estate, relinfo, trigger, event,
 							modifiedCols, oldtup, newtup))
 			continue;
+		/* Inject the tupleindex in the event */
+		if (new_event.ate_flags & AFTER_TRIGGER_FDW)
+		{
+			fdw_tuplestore = GetCurrentFDWTuplestore();
+			((AfterTriggerEventDataFDW *) & new_event)->ate_tupleindex = fdw_tuplestore->fdwts_nextwrite;
+		}
 
 		/*
 		 * If the trigger is a foreign key enforcement trigger, there are
@@ -4692,6 +4939,25 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 
 		afterTriggerAddEvent(&afterTriggers->query_stack[afterTriggers->query_depth],
 							 &new_event, &new_shared);
+	}
+
+	/* Finally, add the tuple to the fdwtuplestore if needed */
+	if (fdw_tuplestore)
+	{
+		int			nbtuple = new_event.ate_flags & AFTER_TRIGGER_2CTIDS ? 2 : 1;
+
+		if (fdw_tuplestore->fdwts_nextwrite > INT_MAX - nbtuple)
+		{
+			elog(ERROR, "Cannot insert, update or delete more than %i tuples in "
+				 "foreign tables with AFTER row-level trigger", INT_MAX);
+		}
+		tuplestore_puttuple(fdw_tuplestore->fdwts_tuplestore, oldtup);
+		fdw_tuplestore->fdwts_nextwrite += nbtuple;
+		/* For an update trigger, also store the second one. */
+		if (new_event.ate_flags & AFTER_TRIGGER_2CTIDS)
+		{
+			tuplestore_puttuple(fdw_tuplestore->fdwts_tuplestore, newtup);
+		}
 	}
 }
 

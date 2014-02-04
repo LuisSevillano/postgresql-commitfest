@@ -150,7 +150,8 @@ extern bool ExecBRDeleteTriggers(EState *estate,
 					 ItemPointer tupleid);
 extern void ExecARDeleteTriggers(EState *estate,
 					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid);
+					 ItemPointer tupleid,
+					 TupleTableSlot *slot);
 extern bool ExecIRDeleteTriggers(EState *estate,
 					 ResultRelInfo *relinfo,
 					 HeapTuple trigtuple);
@@ -167,6 +168,7 @@ extern void ExecARUpdateTriggers(EState *estate,
 					 ResultRelInfo *relinfo,
 					 ItemPointer tupleid,
 					 HeapTuple newtuple,
+					 TupleTableSlot *slot,
 					 List *recheckIndexes);
 extern TupleTableSlot *ExecIRUpdateTriggers(EState *estate,
 					 ResultRelInfo *relinfo,

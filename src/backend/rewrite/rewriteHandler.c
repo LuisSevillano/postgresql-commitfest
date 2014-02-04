@@ -45,7 +45,8 @@ static Query *rewriteRuleAction(Query *parsetree,
 				  CmdType event,
 				  bool *returning_flag);
 static List *adjustJoinTreeList(Query *parsetree, bool removert, int rt_index);
-static void rewriteTargetListIU(Query *parsetree, Relation target_relation,
+static void rewriteTargetListIU(Query *parsetree, RangeTblEntry *target_rte,
+					Relation target_relation,
 					List **attrno_list);
 static TargetEntry *process_matched_tle(TargetEntry *src_tle,
 					TargetEntry *prior_tle,
@@ -642,6 +643,10 @@ adjustJoinTreeList(Query *parsetree, bool removert, int rt_index)
  * 4. Sort the tlist into standard order: non-junk fields in order by resno,
  * then junk fields (these in no particular order).
  *
+ * 5. For an insert on a foreign table with an after trigger, add missing
+ * attribute to the returning targetlist. This is needed to ensure that all
+ * attributes are fetched from the remote side on a returning statement.
+ *
  * We must do items 1,2,3 before firing rewrite rules, else rewritten
  * references to NEW.foo will produce wrong or incomplete results.	Item 4
  * is not needed for rewriting, but will be needed by the planner, and we
@@ -653,8 +658,8 @@ adjustJoinTreeList(Query *parsetree, bool removert, int rt_index)
  * processing VALUES RTEs.
  */
 static void
-rewriteTargetListIU(Query *parsetree, Relation target_relation,
-					List **attrno_list)
+rewriteTargetListIU(Query *parsetree, RangeTblEntry *target_rte,
+					Relation target_relation, List **attrno_list)
 {
 	CmdType		commandType = parsetree->commandType;
 	TargetEntry **new_tles;
@@ -728,6 +733,28 @@ rewriteTargetListIU(Query *parsetree, Relation target_relation,
 			junk_tlist = lappend(junk_tlist, old_tle);
 			next_junk_attrno++;
 		}
+	}
+
+	/*
+	 * For foreign tables, force RETURNING the whole-row if a corresponding
+	 * AFTER trigger is found
+	 */
+	if (target_relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE &&
+		target_relation->trigdesc &&
+		((commandType == CMD_INSERT && target_relation->trigdesc->trig_insert_after_row) ||
+		 (commandType == CMD_UPDATE && target_relation->trigdesc->trig_update_after_row)))
+
+	{
+		Var		   *var = makeWholeRowVar(target_rte,
+										  parsetree->resultRelation,
+										  0,
+										  false);
+		TargetEntry *tle = makeTargetEntry((Expr *) var,
+								   list_length(parsetree->returningList) + 1,
+										   "wholerow",
+										   true);
+
+		parsetree->returningList = lappend(parsetree->returningList, tle);
 	}
 
 	for (attrno = 1; attrno <= numattrs; attrno++)
@@ -818,7 +845,6 @@ rewriteTargetListIU(Query *parsetree, Relation target_relation,
 	}
 
 	pfree(new_tles);
-
 	parsetree->targetList = list_concat(new_tlist, junk_tlist);
 }
 
@@ -1174,7 +1200,7 @@ static void
 rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 					Relation target_relation)
 {
-	Var		   *var;
+	Var		   *var = NULL;
 	const char *attrname;
 	TargetEntry *tle;
 
@@ -1206,7 +1232,27 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 			fdwroutine->AddForeignUpdateTargets(parsetree, target_rte,
 												target_relation);
 
-		return;
+		/*
+		 * If we have a trigger corresponding to the operation, add a wholerow
+		 * attribute.
+		 */
+		if (target_relation->trigdesc &&
+			((parsetree->commandType == CMD_UPDATE &&
+			  (target_relation->trigdesc->trig_update_after_row
+			   || target_relation->trigdesc->trig_update_before_row)) ||
+			 (parsetree->commandType == CMD_DELETE &&
+			  (target_relation->trigdesc->trig_delete_after_row ||
+			   target_relation->trigdesc->trig_delete_before_row))))
+		{
+			var = makeWholeRowVar(target_rte,
+								  parsetree->resultRelation,
+								  0,
+								  false);
+
+			attrname = "wholerow";
+
+		}
+
 	}
 	else
 	{
@@ -1221,13 +1267,15 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 
 		attrname = "wholerow";
 	}
+	if (var != NULL)
+	{
+		tle = makeTargetEntry((Expr *) var,
+							  list_length(parsetree->targetList) + 1,
+							  pstrdup(attrname),
+							  true);
 
-	tle = makeTargetEntry((Expr *) var,
-						  list_length(parsetree->targetList) + 1,
-						  pstrdup(attrname),
-						  true);
-
-	parsetree->targetList = lappend(parsetree->targetList, tle);
+		parsetree->targetList = lappend(parsetree->targetList, tle);
+	}
 }
 
 
@@ -2965,19 +3013,19 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 				List	   *attrnos;
 
 				/* Process the main targetlist ... */
-				rewriteTargetListIU(parsetree, rt_entry_relation, &attrnos);
+				rewriteTargetListIU(parsetree, rt_entry, rt_entry_relation, &attrnos);
 				/* ... and the VALUES expression lists */
 				rewriteValuesRTE(values_rte, rt_entry_relation, attrnos);
 			}
 			else
 			{
 				/* Process just the main targetlist */
-				rewriteTargetListIU(parsetree, rt_entry_relation, NULL);
+				rewriteTargetListIU(parsetree, rt_entry, rt_entry_relation, NULL);
 			}
 		}
 		else if (event == CMD_UPDATE)
 		{
-			rewriteTargetListIU(parsetree, rt_entry_relation, NULL);
+			rewriteTargetListIU(parsetree, rt_entry, rt_entry_relation, NULL);
 			rewriteTargetListUD(parsetree, rt_entry, rt_entry_relation);
 		}
 		else if (event == CMD_DELETE)

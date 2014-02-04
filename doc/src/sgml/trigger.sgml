@@ -33,11 +33,11 @@
    <para>
     A trigger is a specification that the database should automatically
     execute a particular function whenever a certain type of operation is
-    performed.  Triggers can be attached to both tables and views.
+    performed.  Triggers can be attached to tables, views and foreign tables.
   </para>
 
   <para>
-    On tables, triggers can be defined to execute either before or after any
+    On tables and foreign tables, triggers can be defined to execute either before or after any
     <command>INSERT</command>, <command>UPDATE</command>, or
     <command>DELETE</command> operation, either once per modified row,
     or once per <acronym>SQL</acronym> statement.
@@ -46,7 +46,7 @@
     <command>UPDATE</command> statement.
     Triggers can also fire for <command>TRUNCATE</command> statements.
     If a trigger event occurs, the trigger's function is called at the
-    appropriate time to handle the event.
+    appropriate time to handle the event. Foreign tables do not support the TRUNCATE statement at all.
    </para>
 
    <para>
@@ -108,11 +108,11 @@
     statement starts to do anything, while statement-level <literal>AFTER</>
     triggers fire at the very end of the statement.  These types of
     triggers may be defined on tables or views.  Row-level <literal>BEFORE</>
-    triggers fire immediately before a particular row is operated on,
-    while row-level <literal>AFTER</> triggers fire at the end of the
-    statement (but before any statement-level <literal>AFTER</> triggers).
-    These types of triggers may only be defined on tables.  Row-level
-    <literal>INSTEAD OF</> triggers may only be defined on views, and fire
+    triggers fire immediately before a particular row is operated on.
+    For regular and foreign tables, row-level <literal>AFTER</> triggers fire at
+    the end of the statement (but before any statement-level <literal>AFTER</> triggers).
+    These types of triggers may only be defined on tables and foreign tables.
+    Row-level <literal>INSTEAD OF</> triggers may only be defined on views, and fire
     immediately as each row in the view is identified as needing to be
     operated on.
    </para>
