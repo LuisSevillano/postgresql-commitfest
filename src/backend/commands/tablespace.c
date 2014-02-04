@@ -621,13 +621,22 @@ create_tablespace_directories(const char *location, const Oid tablespaceoid)
 	}
 
 	/* Remove old symlink in recovery, in case it points to the wrong place */
+	/* On Windows, lstat() reports junction points as directories */
 	if (InRecovery)
 	{
+#ifdef WIN32
+		if (rmdir(linkloc) < 0 && errno != ENOENT)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove directory \"%s\": %m",
+							linkloc)));
+#else
 		if (unlink(linkloc) < 0 && errno != ENOENT)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not remove symbolic link \"%s\": %m",
 							linkloc)));
+#endif
 	}
 
 	/*
