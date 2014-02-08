@@ -72,4 +72,7 @@ extern bool dsm_impl_op(dsm_op op, dsm_handle handle, Size request_size,
 /* Some implementations cannot resize segments.  Can this one? */
 extern bool dsm_impl_can_resize(void);
 
+/* create a copy of implementation specific handle in postmaster process. */
+extern void dsm_copy_impl_handle(void *impl_private, dsm_handle handle);
+
 #endif   /* DSM_IMPL_H */

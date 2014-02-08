@@ -886,6 +886,40 @@ dsm_keep_mapping(dsm_segment *seg)
 }
 
 /*
+ * Keep a dynamic shared memory segment until end of postmaster.
+ *
+ * This function should not be called more than once per segment,
+ * calling it more number of times will create unnecessary handles
+ * which will consume more memory for no good reason. Though this
+ * behaviour is specific to windows, there is no real benefit for
+ * calling it more than once on other platforms either.
+ *
+ * By default, segments are owned by the current resource owner,
+ * which typically means they stick around for the duration of the
+ * current query only.
+ */
+void
+dsm_keep_segment(dsm_segment *seg)
+{
+	/*
+	 * Bump reference count for this segment in shared memory. This will
+	 * ensure that even if there is no session which is attached to this
+	 * segment, it will stay till postmaster lifetime.
+	 */
+	LWLockAcquire(DynamicSharedMemoryControlLock, LW_EXCLUSIVE);
+	dsm_control->item[seg->control_slot].refcnt++;
+	LWLockRelease(DynamicSharedMemoryControlLock);
+
+	dsm_copy_impl_handle(seg->impl_private, seg->handle);
+
+	if (seg->resowner != NULL)
+	{
+		ResourceOwnerForgetDSM(seg->resowner, seg);
+		seg->resowner = NULL;
+	}
+}
+
+/*
  * Find an existing mapping for a shared memory segment, if there is one.
  */
 dsm_segment *

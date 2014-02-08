@@ -67,6 +67,7 @@
 #include "storage/fd.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "postmaster/postmaster.h"
 
 #ifdef USE_DSM_POSIX
 static bool dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
@@ -112,6 +113,8 @@ int dynamic_shared_memory_type;
 
 /* Size of buffer to be used for zero-filling. */
 #define ZBUFFER_SIZE				8192
+
+#define SEGMENT_NAME_PREFIX			"Global/PostgreSQL"
 
 /*------
  * Perform a low-level shared memory operation in a platform-specific way,
@@ -635,7 +638,7 @@ dsm_impl_windows(dsm_op op, dsm_handle handle, Size request_size,
 	 * convention similar to main shared memory. We can change here once
 	 * issue mentioned in GetSharedMemName is resolved.
 	 */
-	snprintf(name, 64, "Global/PostgreSQL.%u", handle);
+	snprintf(name, 64, "%s.%u", SEGMENT_NAME_PREFIX, handle);
 
 	/*
 	 * Handle teardown cases.  Since Windows automatically destroys the object
@@ -980,6 +983,48 @@ dsm_impl_mmap(dsm_op op, dsm_handle handle, Size request_size,
 
 	return true;
 }
+#endif
+
+#ifdef WIN32
+/*
+ * The purpose of this function is to duplicate segment handle for
+ * postmaster process, as it automatically drops segment if all
+ * referring sessions end. Copying segment handle for postmaster
+ * process ensures that it will retain the segment for postmaster
+ * lifetime. This is a typical behavior for windows, other platforms
+ * don't need to make any such copy.
+ */
+void dsm_copy_impl_handle(void *impl_private, dsm_handle handle)
+{
+	HANDLE		hmap;
+
+	if (!DuplicateHandle(GetCurrentProcess(),
+						 impl_private,
+						 PostmasterHandle,
+						 &hmap,
+						 0,
+						 FALSE,
+						 DUPLICATE_SAME_ACCESS))
+	{
+		char		name[64];
+
+		snprintf(name, 64, "%s.%u", SEGMENT_NAME_PREFIX, handle);
+		_dosmaperr(GetLastError());
+		ereport(ERROR,
+				(errcode_for_dynamic_shared_memory(),
+				 errmsg("could not retain segment \"%s\" for postmaster lifetime: %m",
+						name)));
+	}
+}
+#else
+/*
+ * For non-windows platform, this function is no-op.
+ */
+void dsm_copy_impl_handle(void *impl_private, dsm_handle handle)
+{
+	/* no-op */
+}
+
 #endif
 
 static int
