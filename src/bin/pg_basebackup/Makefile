@@ -41,3 +41,9 @@ uninstall:
 
 clean distclean maintainer-clean:
 	rm -f pg_basebackup$(X) pg_receivexlog$(X) $(OBJS) pg_basebackup.o pg_receivexlog.o
+
+check: all
+	$(prove_check)
+
+installcheck:
+	$(prove_installcheck)
