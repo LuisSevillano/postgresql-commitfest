@@ -39,10 +39,6 @@ int			plpgsql_variable_conflict = PLPGSQL_RESOLVE_ERROR;
 
 bool		plpgsql_print_strict_params = false;
 
-/* Hook for plugins */
-PLpgSQL_plugin **plugin_ptr = NULL;
-
-
 /*
  * _PG_init()			- library load-time initialization
  *
@@ -81,9 +77,6 @@ _PG_init(void)
 	plpgsql_HashTableInit();
 	RegisterXactCallback(plpgsql_xact_cb, NULL);
 	RegisterSubXactCallback(plpgsql_subxact_cb, NULL);
-
-	/* Set up a rendezvous point with optional instrumentation plugin */
-	plugin_ptr = (PLpgSQL_plugin **) find_rendezvous_variable("PLpgSQL_plugin");
 
 	inited = true;
 }
@@ -381,6 +374,24 @@ plpgsql_validator(PG_FUNCTION_ARGS)
 	}
 
 	ReleaseSysCache(tuple);
+
+	PG_RETURN_VOID();
+}
+
+/* ----------
+ *
+ * register any plpgsql plugin
+ *
+ *  ----------
+ */
+PG_FUNCTION_INFO_V1(plpgsql_register_plugin);
+
+Datum
+plpgsql_register_plugin(PG_FUNCTION_ARGS)
+{
+	PLpgSQL_plugin *plugin_ptr = (PLpgSQL_plugin *) PG_GETARG_POINTER(0);
+
+	plpgsql_register_plugin_internal(plugin_ptr);
 
 	PG_RETURN_VOID();
 }

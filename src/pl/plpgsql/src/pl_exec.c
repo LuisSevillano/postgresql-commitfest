@@ -86,6 +86,22 @@ typedef struct SimpleEcontextStackEntry
 static EState *shared_simple_eval_estate = NULL;
 static SimpleEcontextStackEntry *simple_econtext_stack = NULL;
 
+/*
+ * List of pointers and info of registered plugins.
+ */
+typedef struct PluginPtrEntry
+{
+	PLpgSQL_plugin *plugin_ptr;
+	struct PluginPtrEntry *next;
+} PluginPtrEntry;
+
+/*
+ * Allocated in TopMemoryContext
+ */
+static PluginPtrEntry *plugins = NULL;
+static int nplugins = 0;
+static int used_plugin_hook_types = 0;
+
 /************************************************************
  * Local function forward declarations
  ************************************************************/
@@ -235,6 +251,18 @@ static char *format_expr_params(PLpgSQL_execstate *estate,
 								const PLpgSQL_expr *expr);
 static char *format_preparedparamsdata(PLpgSQL_execstate *estate,
 									   const PreparedParamsData *ppd);
+static void **get_plugin_info(PLpgSQL_execstate *estate, int plugin_number);
+
+
+/* Bits for used plugin callback types */
+#define PLUGIN_HOOK_TYPE_FUNC_SETUP					(1 << 0)
+#define PLUGIN_HOOK_TYPE_FUNC_BEG					(1 << 2)
+#define PLUGIN_HOOK_TYPE_FUNC_END					(1 << 3)
+#define PLUGIN_HOOK_TYPE_STMT_BEG					(1 << 4)
+#define PLUGIN_HOOK_TYPE_STMT_END					(1 << 5)
+
+#define EXEC_PLUGIN_HOOK_TYPE(type) \
+	((used_plugin_hook_types & (PLUGIN_HOOK_TYPE_ ## type)) == (PLUGIN_HOOK_TYPE_ ## type))
 
 
 /* ----------
@@ -331,10 +359,28 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 	exec_set_found(&estate, false);
 
 	/*
-	 * Let the instrumentation plugin peek at this function
+	 * Let the instrumentation plugins peek at this function
 	 */
-	if (*plugin_ptr && (*plugin_ptr)->func_beg)
-		((*plugin_ptr)->func_beg) (&estate, func);
+	if (EXEC_PLUGIN_HOOK_TYPE(FUNC_BEG))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; pe = pe->next, i++)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			if (pl_ptr->func_beg)
+			{
+				void **plugin_info;
+
+				plugin_info = get_plugin_info(&estate, i);
+				(pl_ptr->func_beg) (&estate, func, plugin_info);
+			}
+		}
+	}
 
 	/*
 	 * Now call the toplevel block of statements
@@ -479,10 +525,28 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 	estate.err_text = gettext_noop("during function exit");
 
 	/*
-	 * Let the instrumentation plugin peek at this function
+	 * Let the instrumentation plugins peek at this function
 	 */
-	if (*plugin_ptr && (*plugin_ptr)->func_end)
-		((*plugin_ptr)->func_end) (&estate, func);
+	if (EXEC_PLUGIN_HOOK_TYPE(FUNC_END))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			if (pl_ptr->func_end)
+			{
+				void **plugin_info;
+
+				plugin_info = get_plugin_info(&estate, i);
+				(pl_ptr->func_end) (&estate, func, plugin_info);
+			}
+		}
+	}
 
 	/* Clean up any leftover temporary memory */
 	plpgsql_destroy_econtext(&estate);
@@ -699,10 +763,27 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 	exec_set_found(&estate, false);
 
 	/*
-	 * Let the instrumentation plugin peek at this function
+	 * Let the instrumentation plugins peek at this function
 	 */
-	if (*plugin_ptr && (*plugin_ptr)->func_beg)
-		((*plugin_ptr)->func_beg) (&estate, func);
+	if (EXEC_PLUGIN_HOOK_TYPE(FUNC_BEG))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+			void **plugin_info;
+
+			if (pl_ptr->func_beg)
+			{
+				plugin_info = get_plugin_info(&estate, i);
+				(pl_ptr->func_beg) (&estate, func, plugin_info);
+			}
+		}
+	}
 
 	/*
 	 * Now call the toplevel block of statements
@@ -768,10 +849,27 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 	}
 
 	/*
-	 * Let the instrumentation plugin peek at this function
+	 * Let the instrumentation plugins peek at this function
 	 */
-	if (*plugin_ptr && (*plugin_ptr)->func_end)
-		((*plugin_ptr)->func_end) (&estate, func);
+	if (EXEC_PLUGIN_HOOK_TYPE(FUNC_END))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+			void **plugin_info;
+
+			if (pl_ptr->func_end)
+			{
+				plugin_info = get_plugin_info(&estate, i);
+				(pl_ptr->func_end) (&estate, func, plugin_info);
+			}
+		}
+	}
 
 	/* Clean up any leftover temporary memory */
 	plpgsql_destroy_econtext(&estate);
@@ -831,10 +929,28 @@ plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata)
 	var->freeval = true;
 
 	/*
-	 * Let the instrumentation plugin peek at this function
+	 * Let the instrumentation plugins peek at this function
 	 */
-	if (*plugin_ptr && (*plugin_ptr)->func_beg)
-		((*plugin_ptr)->func_beg) (&estate, func);
+	if (EXEC_PLUGIN_HOOK_TYPE(FUNC_BEG))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			if (pl_ptr->func_beg)
+			{
+				void **plugin_info;
+
+				plugin_info = get_plugin_info(&estate, i);
+				(pl_ptr->func_beg) (&estate, func, plugin_info);
+			}
+		}
+	}
 
 	/*
 	 * Now call the toplevel block of statements
@@ -865,10 +981,28 @@ plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata)
 	estate.err_text = gettext_noop("during function exit");
 
 	/*
-	 * Let the instrumentation plugin peek at this function
+	 * Let the instrumentation plugins peek at this function
 	 */
-	if (*plugin_ptr && (*plugin_ptr)->func_end)
-		((*plugin_ptr)->func_end) (&estate, func);
+	if (EXEC_PLUGIN_HOOK_TYPE(FUNC_END))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			if (pl_ptr->func_end)
+			{
+				void **plugin_info;
+
+				plugin_info = get_plugin_info(&estate, i);
+				(pl_ptr->func_end) (&estate, func, plugin_info);
+			}
+		}
+	}
 
 	/* Clean up any leftover temporary memory */
 	plpgsql_destroy_econtext(&estate);
@@ -1389,9 +1523,27 @@ exec_stmt(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
 	save_estmt = estate->err_stmt;
 	estate->err_stmt = stmt;
 
-	/* Let the plugin know that we are about to execute this statement */
-	if (*plugin_ptr && (*plugin_ptr)->stmt_beg)
-		((*plugin_ptr)->stmt_beg) (estate, stmt);
+	/* Let the plugins know that we are about to execute this statement */
+	if (EXEC_PLUGIN_HOOK_TYPE(STMT_BEG))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			if (pl_ptr->stmt_beg)
+			{
+				void **plugin_info;
+
+				plugin_info = get_plugin_info(estate, i);
+				(pl_ptr->stmt_beg) (&estate, stmt, plugin_info);
+			}
+		}
+	}
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -1495,8 +1647,26 @@ exec_stmt(PLpgSQL_execstate *estate, PLpgSQL_stmt *stmt)
 	}
 
 	/* Let the plugin know that we have finished executing this statement */
-	if (*plugin_ptr && (*plugin_ptr)->stmt_end)
-		((*plugin_ptr)->stmt_end) (estate, stmt);
+	if (EXEC_PLUGIN_HOOK_TYPE(STMT_END))
+	{
+		PluginPtrEntry *pe;
+		int i;
+
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; i++, pe = pe->next)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			if (pl_ptr->stmt_end)
+			{
+				void **plugin_info;
+
+				plugin_info = get_plugin_info(estate, i);
+				(pl_ptr->stmt_end) (&estate, stmt, plugin_info);
+			}
+		}
+	}
 
 	estate->err_stmt = save_estmt;
 
@@ -3160,12 +3330,13 @@ plpgsql_estate_setup(PLpgSQL_execstate *estate,
 	estate->err_stmt = NULL;
 	estate->err_text = NULL;
 
-	estate->plugin_info = NULL;
-
 	/*
 	 * Create an EState and ExprContext for evaluation of simple expressions.
 	 */
 	plpgsql_create_econtext(estate);
+
+	estate->plugin_info_vector = NULL;
+	estate->plugin_info_size = 0;
 
 	/*
 	 * Let the plugin see this function before we initialize any local
@@ -3173,13 +3344,30 @@ plpgsql_estate_setup(PLpgSQL_execstate *estate,
 	 * pointers so it can call back into PL/pgSQL for doing things like
 	 * variable assignments and stack traces
 	 */
-	if (*plugin_ptr)
+	if (plugins)
 	{
-		(*plugin_ptr)->error_callback = plpgsql_exec_error_callback;
-		(*plugin_ptr)->assign_expr = exec_assign_expr;
+		PluginPtrEntry *pe;
+		int i;
 
-		if ((*plugin_ptr)->func_setup)
-			((*plugin_ptr)->func_setup) (estate, func);
+		Assert(plugins != NULL);
+
+		for (i = 0, pe = plugins; pe != NULL; pe = pe->next, i++)
+		{
+			PLpgSQL_plugin *pl_ptr = pe->plugin_ptr;
+
+			pl_ptr->error_callback = plpgsql_exec_error_callback;
+			pl_ptr->assign_expr = exec_assign_expr;
+
+			if (EXEC_PLUGIN_HOOK_TYPE(FUNC_SETUP))
+			{
+				void **plugin_info;
+
+				Assert(pl_ptr->func_setup);
+
+				plugin_info = get_plugin_info(estate, i);
+				(pl_ptr->func_setup) (estate, func, plugin_info);
+			}
+		}
 	}
 }
 
@@ -6631,4 +6819,63 @@ format_preparedparamsdata(PLpgSQL_execstate *estate,
 	}
 
 	return paramstr.data;
+}
+
+/*
+ * Register a next plugin info
+ */
+void
+plpgsql_register_plugin_internal(PLpgSQL_plugin *plugin_ptr)
+{
+	PluginPtrEntry *new_entry;
+	PluginPtrEntry *plugin;
+	MemoryContext old_cxt;
+
+	old_cxt = MemoryContextSwitchTo(TopMemoryContext);
+	new_entry = palloc0(sizeof(PluginPtrEntry));
+	MemoryContextSwitchTo(old_cxt);
+
+	/* Order of plugins is important - new plugins must be on end */
+	for (plugin = plugins; plugin->next != NULL; plugin = plugin->next);
+	plugin->next = new_entry;
+	nplugins++;
+
+	used_plugin_hook_types |= (plugin_ptr->func_setup ? PLUGIN_HOOK_TYPE_FUNC_SETUP : 0);
+	used_plugin_hook_types |= (plugin_ptr->func_beg ? PLUGIN_HOOK_TYPE_FUNC_BEG : 0);
+	used_plugin_hook_types |= (plugin_ptr->func_end ? PLUGIN_HOOK_TYPE_FUNC_END : 0);
+	used_plugin_hook_types |= (plugin_ptr->stmt_beg ? PLUGIN_HOOK_TYPE_STMT_BEG : 0);
+	used_plugin_hook_types |= (plugin_ptr->stmt_end ? PLUGIN_HOOK_TYPE_STMT_END : 0);
+}
+
+/*
+ * Ensure enough sized plugin_info_vector. This vector can be resized in runtime.
+ * It is unusual, but there are no reason, why we disallow it.
+ *
+ * Attention: plugins should not to cache plugin_info in private space. This pointer
+ * can be changed due possible repalloc.
+ */
+static void **
+get_plugin_info(PLpgSQL_execstate *estate, int plugin_number)
+{
+	int i;
+
+	if (estate->plugin_info_size >= plugin_number)
+		return (void **) &estate->plugin_info_vector[plugin_number - 1];
+
+	/*
+	 * plugin_info_vector holds a pointers to function execution level
+	 * plugin private memory. Designed implementation expects relatively
+	 * immutable and small number of plugins. plugin_vector is resized
+	 * to number of registered plugins. So usually plugin_info_vector
+	 * is allocated only once.
+	 */
+	estate->plugin_info_vector = repalloc(estate->plugin_info_vector,
+						    nplugins * sizeof(void*));
+
+	for (i = estate->plugin_info_size; i < nplugins - 1; i++)
+		estate->plugin_info_vector[i] = NULL;
+
+	estate->plugin_info_size = nplugins;
+
+	return (void **) &estate->plugin_info_vector[plugin_number - 1];
 }

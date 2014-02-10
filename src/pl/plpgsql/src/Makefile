@@ -19,7 +19,7 @@ rpath =
 
 OBJS = pl_gram.o pl_handler.o pl_comp.o pl_exec.o pl_funcs.o pl_scanner.o
 
-DATA = plpgsql.control plpgsql--1.0.sql plpgsql--unpackaged--1.0.sql
+DATA = plpgsql.control plpgsql--1.1.sql plpgsql--1.0--1.1.sql plpgsql--unpackaged--1.0.sql
 
 all: all-lib
 

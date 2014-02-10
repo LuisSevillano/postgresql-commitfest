@@ -1,6 +1,6 @@
 # plpgsql extension
 comment = 'PL/pgSQL procedural language'
-default_version = '1.0'
+default_version = '1.1'
 module_pathname = '$libdir/plpgsql'
 relocatable = false
 schema = pg_catalog
