@@ -3811,10 +3811,20 @@ XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli,
 	}
 
 	/*
-	 * If the segment was fetched from archival storage, replace the existing
-	 * xlog segment (if any) with the archival version.
+	 * If the segment was fetched from archival storage and either cascading
+	 * replication or standby_mode is enabled, replace the existing xlog
+	 * segment (if any) with the archival version. Cascading replication needs
+	 * this replacement so that cascading walsender can send the xlog segment
+	 * which was restored from the archive. When standby_mode is enabled,
+	 * fast promotion is performed at the end of recovery, and also needs this
+	 * replacement so that the crash recovery just after fast promotion can
+	 * replay all the required segments from pg_xlog.
+	 *
+	 * If the replacement is not required, the segments are always restored onto
+	 * the same file named RECOVERYXLOG from the archive. This prevents the
+	 * large increase of segments in pg_xlog.
 	 */
-	if (source == XLOG_FROM_ARCHIVE)
+	if (source == XLOG_FROM_ARCHIVE && StandbyModeRequested)
 	{
 		KeepFileRestoredFromArchive(path, xlogfname);
 
@@ -5632,22 +5642,63 @@ exitArchiveRecovery(TimeLineID endTLI, XLogSegNo endLogSegNo)
 	}
 
 	/*
-	 * If we are establishing a new timeline, we have to copy data from the
-	 * last WAL segment of the old timeline to create a starting WAL segment
-	 * for the new timeline.
+	 * If the segment was fetched from archival storage and neither cascading
+	 * replication nor fast promotion is enabled, we replace the existing xlog
+	 * segment (if any) with the archival version named RECOVERYXLOG. This is
+	 * because whatever is in XLOGDIR is very possibly older than what we have
+	 * from the archives, since it could have come from restoring a PGDATA
+	 * backup.	In any case, the archival version certainly is more
+	 * descriptive of what our current database state is, because that is what
+	 * we replayed from.
 	 *
-	 * Notify the archiver that the last WAL segment of the old timeline is
-	 * ready to copy to archival storage. Otherwise, it is not archived for a
-	 * while.
+	 * Note that if we are establishing a new timeline, ThisTimeLineID is
+	 * already set to the new value, and so we will create a new file instead
+	 * of overwriting any existing file.  (This is, in fact, always the case
+	 * at present.)
+	 *
+	 * If either cascading replication or fast promotion is enabled, we don't
+	 * need the replacement here because it has already done just after the
+	 * segment was restored from the archive.
 	 */
-	if (endTLI != ThisTimeLineID)
-	{
-		XLogFileCopy(endLogSegNo, endTLI, endLogSegNo);
+	snprintf(recoveryPath, MAXPGPATH, XLOGDIR "/RECOVERYXLOG");
+	XLogFilePath(xlogpath, ThisTimeLineID, endLogSegNo);
 
-		if (XLogArchivingActive())
+	if (restoredFromArchive && !StandbyModeRequested)
+	{
+		unlink(xlogpath);		/* might or might not exist */
+		if (rename(recoveryPath, xlogpath) != 0)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not rename file \"%s\" to \"%s\": %m",
+							recoveryPath, xlogpath)));
+		/* XXX might we need to fix permissions on the file? */
+	}
+	else
+	{
+		/*
+		 * Since there might be a partial WAL segment named RECOVERYXLOG,
+		 * get rid of it.
+		 */
+		unlink(recoveryPath);	/* ignore any error */
+
+		/*
+		 * If we are establishing a new timeline, we have to copy data from
+		 * the last WAL segment of the old timeline to create a starting WAL
+		 * segment for the new timeline.
+		 *
+		 * Notify the archiver that the last WAL segment of the old timeline
+		 * is ready to copy to archival storage. Otherwise, it is not archived
+		 * for a while.
+		 */
+		if (endTLI != ThisTimeLineID)
 		{
-			XLogFileName(xlogpath, endTLI, endLogSegNo);
-			XLogArchiveNotify(xlogpath);
+			XLogFileCopy(endLogSegNo, endTLI, endLogSegNo);
+
+			if (XLogArchivingActive())
+			{
+				XLogFileName(xlogpath, endTLI, endLogSegNo);
+				XLogArchiveNotify(xlogpath);
+			}
 		}
 	}
 
@@ -5657,13 +5708,6 @@ exitArchiveRecovery(TimeLineID endTLI, XLogSegNo endLogSegNo)
 	 */
 	XLogFileName(xlogpath, ThisTimeLineID, endLogSegNo);
 	XLogArchiveCleanup(xlogpath);
-
-	/*
-	 * Since there might be a partial WAL segment named RECOVERYXLOG, get rid
-	 * of it.
-	 */
-	snprintf(recoveryPath, MAXPGPATH, XLOGDIR "/RECOVERYXLOG");
-	unlink(recoveryPath);		/* ignore any error */
 
 	/* Get rid of any remaining recovered timeline-history file, too */
 	snprintf(recoveryPath, MAXPGPATH, XLOGDIR "/RECOVERYHISTORY");
