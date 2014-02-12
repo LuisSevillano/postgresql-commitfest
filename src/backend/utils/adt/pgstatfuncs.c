@@ -536,7 +536,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(14, false);
+		tupdesc = CreateTemplateTupleDesc(16, false);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "datid",
 						   OIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "pid",
@@ -565,6 +565,10 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 14, "client_port",
 						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 15, "backend_xid",
+						   XIDOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 16, "backend_xmin",
+						   XIDOID, -1, 0);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
@@ -588,11 +592,11 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 			for (i = 1; i <= n; i++)
 			{
-				PgBackendStatus *be = pgstat_fetch_stat_beentry(i);
+				LocalPgBackendStatus *be = pgstat_fetch_stat_beentry(i);
 
 				if (be)
 				{
-					if (be->st_procpid == pid)
+					if (be->backendStatus.st_procpid == pid)
 					{
 						*(int *) (funcctx->user_fctx) = i;
 						break;
@@ -616,10 +620,10 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 	if (funcctx->call_cntr < funcctx->max_calls)
 	{
 		/* for each row */
-		Datum		values[14];
-		bool		nulls[14];
+		Datum		values[16];
+		bool		nulls[16];
 		HeapTuple	tuple;
-		PgBackendStatus *beentry;
+		LocalPgBackendStatus *beentry;
 
 		MemSet(values, 0, sizeof(values));
 		MemSet(nulls, 0, sizeof(nulls));
@@ -649,20 +653,26 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 		}
 
 		/* Values available to all callers */
-		values[0] = ObjectIdGetDatum(beentry->st_databaseid);
-		values[1] = Int32GetDatum(beentry->st_procpid);
-		values[2] = ObjectIdGetDatum(beentry->st_userid);
-		if (beentry->st_appname)
-			values[3] = CStringGetTextDatum(beentry->st_appname);
+		values[0] = ObjectIdGetDatum(beentry->backendStatus.st_databaseid);
+		values[1] = Int32GetDatum(beentry->backendStatus.st_procpid);
+		values[2] = ObjectIdGetDatum(beentry->backendStatus.st_userid);
+		if (beentry->backendStatus.st_appname)
+			values[3] = CStringGetTextDatum(beentry->backendStatus.st_appname);
 		else
 			nulls[3] = true;
 
+		values[14] = TransactionIdGetDatum(beentry->backend_xid);
+		nulls[14] = false;
+
+		values[15] = TransactionIdGetDatum(beentry->backend_xmin);
+		nulls[15] = false;
+
 		/* Values only available to same user or superuser */
-		if (superuser() || beentry->st_userid == GetUserId())
+		if (superuser() || beentry->backendStatus.st_userid == GetUserId())
 		{
 			SockAddr	zero_clientaddr;
 
-			switch (beentry->st_state)
+			switch (beentry->backendStatus.st_state)
 			{
 				case STATE_IDLE:
 					values[4] = CStringGetTextDatum("idle");
@@ -687,32 +697,32 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 					break;
 			}
 
-			values[5] = CStringGetTextDatum(beentry->st_activity);
-			values[6] = BoolGetDatum(beentry->st_waiting);
+			values[5] = CStringGetTextDatum(beentry->backendStatus.st_activity);
+			values[6] = BoolGetDatum(beentry->backendStatus.st_waiting);
 
-			if (beentry->st_xact_start_timestamp != 0)
-				values[7] = TimestampTzGetDatum(beentry->st_xact_start_timestamp);
+			if (beentry->backendStatus.st_xact_start_timestamp != 0)
+				values[7] = TimestampTzGetDatum(beentry->backendStatus.st_xact_start_timestamp);
 			else
 				nulls[7] = true;
 
-			if (beentry->st_activity_start_timestamp != 0)
-				values[8] = TimestampTzGetDatum(beentry->st_activity_start_timestamp);
+			if (beentry->backendStatus.st_activity_start_timestamp != 0)
+				values[8] = TimestampTzGetDatum(beentry->backendStatus.st_activity_start_timestamp);
 			else
 				nulls[8] = true;
 
-			if (beentry->st_proc_start_timestamp != 0)
-				values[9] = TimestampTzGetDatum(beentry->st_proc_start_timestamp);
+			if (beentry->backendStatus.st_proc_start_timestamp != 0)
+				values[9] = TimestampTzGetDatum(beentry->backendStatus.st_proc_start_timestamp);
 			else
 				nulls[9] = true;
 
-			if (beentry->st_state_start_timestamp != 0)
-				values[10] = TimestampTzGetDatum(beentry->st_state_start_timestamp);
+			if (beentry->backendStatus.st_state_start_timestamp != 0)
+				values[10] = TimestampTzGetDatum(beentry->backendStatus.st_state_start_timestamp);
 			else
 				nulls[10] = true;
 
 			/* A zeroed client addr means we don't know */
 			memset(&zero_clientaddr, 0, sizeof(zero_clientaddr));
-			if (memcmp(&(beentry->st_clientaddr), &zero_clientaddr,
+			if (memcmp(&(beentry->backendStatus.st_clientaddr), &zero_clientaddr,
 					   sizeof(zero_clientaddr)) == 0)
 			{
 				nulls[11] = true;
@@ -721,9 +731,9 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			}
 			else
 			{
-				if (beentry->st_clientaddr.addr.ss_family == AF_INET
+				if (beentry->backendStatus.st_clientaddr.addr.ss_family == AF_INET
 #ifdef HAVE_IPV6
-					|| beentry->st_clientaddr.addr.ss_family == AF_INET6
+					|| beentry->backendStatus.st_clientaddr.addr.ss_family == AF_INET6
 #endif
 					)
 				{
@@ -733,18 +743,18 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 					remote_host[0] = '\0';
 					remote_port[0] = '\0';
-					ret = pg_getnameinfo_all(&beentry->st_clientaddr.addr,
-											 beentry->st_clientaddr.salen,
+					ret = pg_getnameinfo_all(&beentry->backendStatus.st_clientaddr.addr,
+											 beentry->backendStatus.st_clientaddr.salen,
 											 remote_host, sizeof(remote_host),
 											 remote_port, sizeof(remote_port),
 											 NI_NUMERICHOST | NI_NUMERICSERV);
 					if (ret == 0)
 					{
-						clean_ipv6_addr(beentry->st_clientaddr.addr.ss_family, remote_host);
+						clean_ipv6_addr(beentry->backendStatus.st_clientaddr.addr.ss_family, remote_host);
 						values[11] = DirectFunctionCall1(inet_in,
 											   CStringGetDatum(remote_host));
-						if (beentry->st_clienthostname)
-							values[12] = CStringGetTextDatum(beentry->st_clienthostname);
+						if (beentry->backendStatus.st_clienthostname)
+							values[12] = CStringGetTextDatum(beentry->backendStatus.st_clienthostname);
 						else
 							nulls[12] = true;
 						values[13] = Int32GetDatum(atoi(remote_port));
@@ -756,7 +766,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 						nulls[13] = true;
 					}
 				}
-				else if (beentry->st_clientaddr.addr.ss_family == AF_UNIX)
+				else if (beentry->backendStatus.st_clientaddr.addr.ss_family == AF_UNIX)
 				{
 					/*
 					 * Unix sockets always reports NULL for host and -1 for
@@ -815,12 +825,12 @@ Datum
 pg_stat_get_backend_pid(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	PG_RETURN_INT32(beentry->st_procpid);
+	PG_RETURN_INT32(beentry->backendStatus.st_procpid);
 }
 
 
@@ -828,12 +838,12 @@ Datum
 pg_stat_get_backend_dbid(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	PG_RETURN_OID(beentry->st_databaseid);
+	PG_RETURN_OID(beentry->backendStatus.st_databaseid);
 }
 
 
@@ -841,12 +851,12 @@ Datum
 pg_stat_get_backend_userid(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	PG_RETURN_OID(beentry->st_userid);
+	PG_RETURN_OID(beentry->backendStatus.st_userid);
 }
 
 
@@ -854,17 +864,17 @@ Datum
 pg_stat_get_backend_activity(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 	const char *activity;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		activity = "<backend information not available>";
-	else if (!superuser() && beentry->st_userid != GetUserId())
+	else if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		activity = "<insufficient privilege>";
-	else if (*(beentry->st_activity) == '\0')
+	else if (*(beentry->backendStatus.st_activity) == '\0')
 		activity = "<command string not enabled>";
 	else
-		activity = beentry->st_activity;
+		activity = beentry->backendStatus.st_activity;
 
 	PG_RETURN_TEXT_P(cstring_to_text(activity));
 }
@@ -875,15 +885,15 @@ pg_stat_get_backend_waiting(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
 	bool		result;
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	if (!superuser() && beentry->st_userid != GetUserId())
+	if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		PG_RETURN_NULL();
 
-	result = beentry->st_waiting;
+	result = beentry->backendStatus.st_waiting;
 
 	PG_RETURN_BOOL(result);
 }
@@ -894,15 +904,15 @@ pg_stat_get_backend_activity_start(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
 	TimestampTz result;
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	if (!superuser() && beentry->st_userid != GetUserId())
+	if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		PG_RETURN_NULL();
 
-	result = beentry->st_activity_start_timestamp;
+	result = beentry->backendStatus.st_activity_start_timestamp;
 
 	/*
 	 * No time recorded for start of current query -- this is the case if the
@@ -920,15 +930,15 @@ pg_stat_get_backend_xact_start(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
 	TimestampTz result;
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	if (!superuser() && beentry->st_userid != GetUserId())
+	if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		PG_RETURN_NULL();
 
-	result = beentry->st_xact_start_timestamp;
+	result = beentry->backendStatus.st_xact_start_timestamp;
 
 	if (result == 0)			/* not in a transaction */
 		PG_RETURN_NULL();
@@ -942,15 +952,15 @@ pg_stat_get_backend_start(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
 	TimestampTz result;
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	if (!superuser() && beentry->st_userid != GetUserId())
+	if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		PG_RETURN_NULL();
 
-	result = beentry->st_proc_start_timestamp;
+	result = beentry->backendStatus.st_proc_start_timestamp;
 
 	if (result == 0)			/* probably can't happen? */
 		PG_RETURN_NULL();
@@ -963,7 +973,7 @@ Datum
 pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 	SockAddr	zero_clientaddr;
 	char		remote_host[NI_MAXHOST];
 	int			ret;
@@ -971,16 +981,16 @@ pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	if (!superuser() && beentry->st_userid != GetUserId())
+	if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		PG_RETURN_NULL();
 
 	/* A zeroed client addr means we don't know */
 	memset(&zero_clientaddr, 0, sizeof(zero_clientaddr));
-	if (memcmp(&(beentry->st_clientaddr), &zero_clientaddr,
+	if (memcmp(&(beentry->backendStatus.st_clientaddr), &zero_clientaddr,
 			   sizeof(zero_clientaddr)) == 0)
 		PG_RETURN_NULL();
 
-	switch (beentry->st_clientaddr.addr.ss_family)
+	switch (beentry->backendStatus.st_clientaddr.addr.ss_family)
 	{
 		case AF_INET:
 #ifdef HAVE_IPV6
@@ -992,15 +1002,15 @@ pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 	}
 
 	remote_host[0] = '\0';
-	ret = pg_getnameinfo_all(&beentry->st_clientaddr.addr,
-							 beentry->st_clientaddr.salen,
+	ret = pg_getnameinfo_all(&beentry->backendStatus.st_clientaddr.addr,
+							 beentry->backendStatus.st_clientaddr.salen,
 							 remote_host, sizeof(remote_host),
 							 NULL, 0,
 							 NI_NUMERICHOST | NI_NUMERICSERV);
 	if (ret != 0)
 		PG_RETURN_NULL();
 
-	clean_ipv6_addr(beentry->st_clientaddr.addr.ss_family, remote_host);
+	clean_ipv6_addr(beentry->backendStatus.st_clientaddr.addr.ss_family, remote_host);
 
 	PG_RETURN_INET_P(DirectFunctionCall1(inet_in,
 										 CStringGetDatum(remote_host)));
@@ -1010,7 +1020,7 @@ Datum
 pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 {
 	int32		beid = PG_GETARG_INT32(0);
-	PgBackendStatus *beentry;
+	LocalPgBackendStatus *beentry;
 	SockAddr	zero_clientaddr;
 	char		remote_port[NI_MAXSERV];
 	int			ret;
@@ -1018,16 +1028,16 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
 		PG_RETURN_NULL();
 
-	if (!superuser() && beentry->st_userid != GetUserId())
+	if (!superuser() && beentry->backendStatus.st_userid != GetUserId())
 		PG_RETURN_NULL();
 
 	/* A zeroed client addr means we don't know */
 	memset(&zero_clientaddr, 0, sizeof(zero_clientaddr));
-	if (memcmp(&(beentry->st_clientaddr), &zero_clientaddr,
+	if (memcmp(&(beentry->backendStatus.st_clientaddr), &zero_clientaddr,
 			   sizeof(zero_clientaddr)) == 0)
 		PG_RETURN_NULL();
 
-	switch (beentry->st_clientaddr.addr.ss_family)
+	switch (beentry->backendStatus.st_clientaddr.addr.ss_family)
 	{
 		case AF_INET:
 #ifdef HAVE_IPV6
@@ -1041,8 +1051,8 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 	}
 
 	remote_port[0] = '\0';
-	ret = pg_getnameinfo_all(&beentry->st_clientaddr.addr,
-							 beentry->st_clientaddr.salen,
+	ret = pg_getnameinfo_all(&beentry->backendStatus.st_clientaddr.addr,
+							 beentry->backendStatus.st_clientaddr.salen,
 							 NULL, 0,
 							 remote_port, sizeof(remote_port),
 							 NI_NUMERICHOST | NI_NUMERICSERV);
@@ -1065,9 +1075,9 @@ pg_stat_get_db_numbackends(PG_FUNCTION_ARGS)
 	result = 0;
 	for (beid = 1; beid <= tot_backends; beid++)
 	{
-		PgBackendStatus *beentry = pgstat_fetch_stat_beentry(beid);
+		LocalPgBackendStatus *beentry = pgstat_fetch_stat_beentry(beid);
 
-		if (beentry && beentry->st_databaseid == dbid)
+		if (beentry && beentry->backendStatus.st_databaseid == dbid)
 			result++;
 	}
 
